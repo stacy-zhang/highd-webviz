@@ -1,0 +1,17 @@
+name: napari-resview
+display_name: Resview
+# use 'hidden' to remove plugin from napari hub search results
+visibility: public
+# see https://napari.org/stable/plugins/technical_references/manifest.html#fields for valid categories
+# categories: []
+contributions:
+  commands:
+    - id: napari-resview.make_resview_widget
+      python_name: napari_resview.resview_widget:ResviewDockWidget
+      title: Resview
+  widgets:
+    - command: napari-resview.make_resview_widget
+      display_name: Resview
+  menus:
+    napari/layers/segment:
+      - command: napari-resview.make_resview_widget
