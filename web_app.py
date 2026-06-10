@@ -433,8 +433,8 @@ def create_server():
                 html.Input(
                     v_model=("opacity_scale", ""),
                     type="number",
-                    min="0.1",
-                    max="4.0",
+                    min="0.0",
+                    max="1.0",
                     step="0.1",
                     style="width:100%; margin-bottom:12px;",
                 )
