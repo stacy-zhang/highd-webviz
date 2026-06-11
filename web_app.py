@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Optional, Tuple
 import importlib
@@ -180,6 +181,14 @@ def create_server():
     state.setdefault("diffuse", 0.7)
     state.setdefault("specular", 0.3)
     state.setdefault("specular_power", 10.0)
+
+    # File browser dialog state
+    state.setdefault("fb_show", False)
+    state.setdefault("fb_cwd", str(Path.home()))
+    state.setdefault("fb_items", [])
+    state.setdefault("fb_target", "")
+    state.setdefault("fb_mode", "file")
+    state.setdefault("fb_title", "Select a file")
 
     renderer = vtkRenderer()
     renderer.SetBackground(0.10, 0.10, 0.12)
@@ -364,6 +373,80 @@ def create_server():
     def refresh_rendering(**kwargs):
         _update_rendering()
 
+    def _fb_refresh(path: str):
+        target_dir = Path(_ensure_path(path)).expanduser()
+        if not target_dir.is_dir():
+            target_dir = target_dir.parent if target_dir.parent.is_dir() else Path.home()
+        mode = _ensure_path(state.fb_mode) or "file"
+        entries = []
+        try:
+            items = sorted(
+                target_dir.iterdir(),
+                key=lambda p: (not p.is_dir(), p.name.lower()),
+            )
+        except (PermissionError, OSError):
+            items = []
+        for item in items:
+            try:
+                is_dir = item.is_dir()
+            except OSError:
+                continue
+            if mode == "dir" and not is_dir:
+                continue
+            entries.append(
+                {
+                    "name": item.name,
+                    "path": str(item),
+                    "is_dir": is_dir,
+                    "label": ("\U0001F4C1 " if is_dir else "\U0001F4C4 ") + item.name,
+                }
+            )
+        state.fb_cwd = str(target_dir)
+        state.fb_items = entries
+
+    def _fb_open(target, mode="file"):
+        target = _ensure_path(target)
+        mode = _ensure_path(mode) or "file"
+        titles = {
+            "setup_path": "Select a YAML setup file",
+            "tiff_dir": "Select a TIFF directory",
+            "spec_path": "Select a SPEC file",
+        }
+        state.fb_target = target
+        state.fb_mode = mode
+        state.fb_title = titles.get(target, "Select a file")
+        current = _ensure_path(getattr(state, target, ""))
+        start = Path(current).expanduser()
+        if current and start.is_dir():
+            start_dir = start
+        elif current and start.parent.is_dir():
+            start_dir = start.parent
+        else:
+            start_dir = Path.home()
+        _fb_refresh(str(start_dir))
+        state.fb_show = True
+
+    def _fb_up():
+        _fb_refresh(str(Path(_ensure_path(state.fb_cwd)).parent))
+
+    def _fb_click(path, is_dir):
+        if is_dir:
+            _fb_refresh(_ensure_path(path))
+        else:
+            target = _ensure_path(state.fb_target)
+            if target:
+                setattr(state, target, _ensure_path(path))
+            state.fb_show = False
+
+    def _fb_select_dir():
+        target = _ensure_path(state.fb_target)
+        if target:
+            setattr(state, target, _ensure_path(state.fb_cwd))
+        state.fb_show = False
+
+    def _fb_cancel():
+        state.fb_show = False
+
     with DivLayout(server) as layout:
         with html.Div(
             style=(
@@ -390,21 +473,28 @@ def create_server():
                 )
                 html.Label("Experiment YAML setup file")
                 html.Input(
-                    v_model=("setup_path", ""),
-                    placeholder="/path/to/setup.yaml",
-                    style="width:100%; margin-bottom:12px;",
+                    v_model=("setup_path", os.path.join(os.path.expanduser("~"), ".rsm3d_defaults.yaml")), # the second arg sets the initial value in the input field, suggesting a default path to the user
+                    #placeholder="/path/to/setup.yaml",
+                    placeholder = os.path.join(os.path.expanduser("~"), ".rsm3d_defaults.yaml"), # suggest default path to YAML setup file
+                    readonly=True,
+                    click=(_fb_open, "['setup_path', 'file']"),
+                    style="width:100%; margin-bottom:12px; cursor:pointer;",
                 )
                 html.Label("TIFF directory")
                 html.Input(
                     v_model=("tiff_dir", ""),
                     placeholder="/path/to/tiff_folder",
-                    style="width:100%; margin-bottom:12px;",
+                    readonly=True,
+                    click=(_fb_open, "['tiff_dir', 'dir']"),
+                    style="width:100%; margin-bottom:12px; cursor:pointer;",
                 )
                 html.Label("SPEC file (ISR only)")
                 html.Input(
                     v_model=("spec_path", ""),
                     placeholder="/path/to/specfile.spec",
-                    style="width:100%; margin-bottom:12px;",
+                    readonly=True,
+                    click=(_fb_open, "['spec_path', 'file']"),
+                    style="width:100%; margin-bottom:12px; cursor:pointer;",
                 )
                 html.Label("Space")
                 html.Select(
@@ -522,6 +612,61 @@ def create_server():
                     ],
                 )
                 remote_view
+
+        # File browser modal dialog
+        with html.Div(  
+            v_if="fb_show",
+            style=(
+                "position:fixed; inset:0; background:rgba(0,0,0,0.6); display:flex; "
+                "align-items:center; justify-content:center; z-index:1000;"
+            ),
+        ):
+            with html.Div(
+                style=(
+                    "width:600px; max-width:90vw; max-height:70vh; background:#1c1c1c; "
+                    "border:1px solid #444; border-radius:8px; padding:16px; box-sizing:border-box; "
+                    "display:flex; flex-direction:column; color:#f3f3f3;"
+                ),
+            ):
+                html.H3(v_text="fb_title", style="margin:0 0 8px 0;")
+                html.Div(
+                    v_text="fb_cwd",
+                    style="font-size:0.85rem; color:#aaa; margin-bottom:8px; word-break:break-all;",
+                )
+                with html.Div(style="display:flex; gap:8px; margin-bottom:8px;"): 
+                    html.Button(
+                        "\u2B06 Back",
+                        click=_fb_up,
+                        style="padding:6px 12px;",
+                    )
+                    html.Button(
+                        "Select",
+                        v_if="fb_mode === 'dir'",
+                        click=_fb_select_dir,
+                        style="padding:6px 12px;",
+                    )
+                with html.Div(
+                    style=(
+                        "flex:1; overflow:auto; background:#101010; border:1px solid #333; "
+                        "border-radius:6px; min-height:200px;"
+                    ),
+                ):
+                    html.Div(
+                        "{{ item.label }}",
+                        v_for="(item, index) in fb_items",
+                        key="index",
+                        click=(_fb_click, "[item.path, item.is_dir]"),
+                        style=(
+                            "padding:6px 10px; cursor:pointer; border-bottom:1px solid #222; "
+                            "white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"
+                        ),
+                    )
+                with html.Div(style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px;"):
+                    html.Button(
+                        "Cancel",
+                        click=_fb_cancel,
+                        style="padding:6px 12px;",
+                    )
 
     return server
 
