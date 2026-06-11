@@ -451,7 +451,7 @@ def create_server():
         with html.Div(
             style=(
                 "display:flex; flex-direction:row; align-items:flex-start; "
-                "height:100vh; margin:0; padding:0; background:#121212; color:#f3f3f3;"
+                "height:100vh; margin:0; padding:0; background:#121212; color:#f3f3f3; font-family:sans-serif;"
             )
         ):
             with html.Div(
@@ -618,7 +618,7 @@ def create_server():
             v_if="fb_show",
             style=(
                 "position:fixed; inset:0; background:rgba(0,0,0,0.6); display:flex; "
-                "align-items:center; justify-content:center; z-index:1000;"
+                "align-items:center; justify-content:center; z-index:1000; font-family:sans-serif;"
             ),
         ):
             with html.Div(
