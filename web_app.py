@@ -449,15 +449,16 @@ def create_server():
 
     with DivLayout(server) as layout:
         with html.Div(
-            style=(
-                "display:flex; flex-direction:row; align-items:flex-start; "
-                "height:100vh; margin:0; padding:0; background:#121212; color:#f3f3f3; font-family:sans-serif;"
+            style=( 
+                "display:flex; flex-direction:row; align-items:stretch; "
+                "height:100vh; overflow:hidden; margin:0; padding:0; "
+                "background:#ffffff; color:rgba(0,0,0,0.87); font-family:sans-serif;"
             )
         ):
             with html.Div(
-                style=(
-                    "width:360px; min-width:320px; padding:16px; overflow:auto; "
-                    "box-sizing:border-box; background:#181818; border-right:1px solid #333;"
+                style=( # sets style of the left control panel
+                    "width:360px; min-width:320px; height:100vh; padding:16px; overflow-y:auto; "
+                    "box-sizing:border-box; background:#ffffff; border-right:1px solid #e0e0e0;"
                 )
             ):
                 html.H2("Napari ResView Web")
@@ -592,17 +593,17 @@ def create_server():
                     placeholder="/path/to/output.vtr",
                     style="width:100%; margin-top:12px; margin-bottom:12px;",
                 )
-                html.Hr(style="border-color:#333; margin:16px 0;")
+                html.Hr(style="border-color:#e0e0e0; margin:16px 0;")
                 html.Strong("Status")
-                html.Pre(v_text="status", style="white-space:pre-wrap; background:#101010; padding:12px; border-radius:6px; margin-top:8px; color:#e8e8e8; min-height:90px;")
+                html.Pre(v_text="status", style="white-space:pre-wrap; background:#f5f5f5; padding:12px; border-radius:6px; margin-top:8px; color:rgba(0,0,0,0.87); border:1px solid #e0e0e0; min-height:90px;")
                 html.P(
-                    style="font-size:0.90rem; margin-top:12px; color:#bbb;",
+                    style="font-size:0.90rem; margin-top:12px; color:#666;",
                     children=[
                         f"Scalar range: ", html.Strong(v_text="scalar_range"), html.Br(),
-                        f"Volume dims: ", html.Strong(v_text="volume_dims"),
+                        f"Dimensions: ", html.Strong(v_text="volume_dims"),
                     ],
                 )
-            with html.Div(style="flex:1; min-width:0; background:#0f0f12; display:flex; flex-direction:column;"):
+            with html.Div(style="flex:1; min-width:0; height:100vh; background:#0f0f12; display:flex; flex-direction:column;"):
                 html.Div(
                     style="padding:12px 16px; color:#f5f5f5; background:#141414; border-bottom:1px solid #333;",
                     children=[
@@ -622,15 +623,15 @@ def create_server():
         ):
             with html.Div(
                 style=(
-                    "width:600px; max-width:90vw; max-height:70vh; background:#1c1c1c; "
-                    "border:1px solid #444; border-radius:8px; padding:16px; box-sizing:border-box; "
-                    "display:flex; flex-direction:column; color:#f3f3f3;"
+                    "width:600px; max-width:90vw; max-height:70vh; background:#ffffff; "
+                    "border:1px solid #e0e0e0; border-radius:8px; padding:16px; box-sizing:border-box; "
+                    "display:flex; flex-direction:column; color:rgba(0,0,0,0.87);"
                 ),
             ):
                 html.H3(v_text="fb_title", style="margin:0 0 8px 0;")
                 html.Div(
                     v_text="fb_cwd",
-                    style="font-size:0.85rem; color:#aaa; margin-bottom:8px; word-break:break-all;",
+                    style="font-size:0.85rem; color:#666; margin-bottom:8px; word-break:break-all;",
                 )
                 with html.Div(style="display:flex; gap:8px; margin-bottom:8px;"): 
                     html.Button(
@@ -646,7 +647,7 @@ def create_server():
                     )
                 with html.Div(
                     style=(
-                        "flex:1; overflow:auto; background:#101010; border:1px solid #333; "
+                        "flex:1; overflow:auto; background:#fafafa; border:1px solid #e0e0e0; "
                         "border-radius:6px; min-height:200px;"
                     ),
                 ):
@@ -656,7 +657,7 @@ def create_server():
                         key="index",
                         click=(_fb_click, "[item.path, item.is_dir]"),
                         style=(
-                            "padding:6px 10px; cursor:pointer; border-bottom:1px solid #222; "
+                            "padding:6px 10px; cursor:pointer; border-bottom:1px solid #eeeeee; "
                             "white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"
                         ),
                     )
