@@ -9,23 +9,25 @@ Features
 """
 
 import argparse
-import base64
+import base64 # for encoding colormap preview images as data-URIs
+# data-URI is a way to embed small images directly in HTML/CSS as text, without needing separate files
 import io
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg") # use non-interactive backend for colormap rendering (Agg means "Anti-Grain Geometry")
 import matplotlib.pyplot as plt          # noqa: E402
 import matplotlib.cm as mpl_cm            # noqa: E402
 import numpy as np                        # noqa: E402
 
-from trame.app import get_server
-from trame.ui.vuetify3 import SinglePageWithDrawerLayout
+from trame.app import get_server # Trame server framework
+from trame.ui.vuetify3 import SinglePageWithDrawerLayout 
 from trame.widgets import vuetify3 as vuetify, vtk as vtk_widgets, html
+# Vuetify provides pre-built UI components (buttons, sliders, dialogs, etc.)
 
 from vtkmodules.vtkCommonDataModel import (
-    vtkPlane,
-    vtkPiecewiseFunction,
+    vtkPlane, # for slicing the volume with axis-aligned planes
+    vtkPiecewiseFunction, # for defining the opacity transfer function (mapping scalar values to opacity)
 )
 
 from vtkmodules.vtkFiltersModeling import vtkOutlineFilter
