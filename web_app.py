@@ -1,4 +1,5 @@
 import os
+import asyncio
 from pathlib import Path
 from typing import Optional, Tuple
 import importlib
@@ -190,6 +191,9 @@ def create_server():
     state.setdefault("fb_mode", "file")
     state.setdefault("fb_title", "Select a file")
 
+    # Sidebar visibility
+    state.setdefault("sidebar_open", True)
+
     renderer = vtkRenderer()
     renderer.SetBackground(0.10, 0.10, 0.12)
 
@@ -227,6 +231,15 @@ def create_server():
     
     # Defer VtkRemoteView creation until the UI context is built
     remote_view = None
+
+    def _set_status(message: str):
+        """Update the Status box and push it to the client immediately.
+
+        Flushing is required so the message appears live; otherwise trame only
+        sends state changes to the browser once the event handler returns.
+        """
+        state.status = str(message)
+        state.flush("status")
 
     def _update_rendering():
         if current_volume is None:
@@ -287,91 +300,139 @@ def create_server():
         _update_rendering()
         return current_volume, current_axes
 
-    def _build_rsm():
+    @ctrl.set("build_rsm")
+    async def build_rsm(**kwargs):
         nonlocal current_builder
-        state.status = "Loading experiment and TIFF frames..."
         setup_path = Path(_ensure_path(state.setup_path)).expanduser()
         tiff_dir = Path(_ensure_path(state.tiff_dir)).expanduser()
         loader_mode = _ensure_path(state.loader_mode).upper() or "CMS"
 
         if not setup_path.is_file():
-            state.status = "Missing YAML setup file."
+            _set_status("Missing YAML setup file.")
             return
         if not tiff_dir.is_dir():
-            state.status = "Missing TIFF directory."
+            _set_status("Missing TIFF directory.")
             return
+        if loader_mode == "ISR":
+            spec_path = Path(_ensure_path(state.spec_path)).expanduser()
+            if not spec_path.is_file():
+                _set_status("Missing SPEC file for ISR mode.")
+                return
 
         crop_window = _crop_window_from_state(state)
+        loop = asyncio.get_event_loop()
 
         try:
-            if loader_mode == "ISR":
-                spec_path = Path(_ensure_path(state.spec_path)).expanduser()
-                if not spec_path.is_file():
-                    state.status = "Missing SPEC file for ISR mode."
-                    return
-                loader = RSMDataLoader_ISR(
-                    str(spec_path),
-                    str(setup_path),
-                    str(tiff_dir),
-                    use_dask=False,
-                )
-                setup, ub, df = loader.load()
-                if crop_window is not None:
-                    df = _crop_dataframe_intensity(df, crop_window)
-                    _adjust_setup_for_crop(setup, crop_window)
-            else:
-                loader = RSMDataloader_CMS(
-                    str(setup_path),
-                    str(tiff_dir),
-                    crop_window=crop_window,
-                )
-                setup, ub, df = loader.load()
-                if crop_window is not None:
-                    _adjust_setup_for_crop(setup, crop_window)
-
-            state.status = "Computing Q/HKL mapping..."
-            current_builder = RSMBuilder(setup, ub, df, ub_includes_2pi=True)
-            current_builder.compute_full(verbose=False)
-
-            grid_size = max(16, int(_float(state.grid_size, 90)))
-            state.status = "Regridding to 3D volume..."
-            volume, axes = current_builder.regrid_xu(
-                space=_ensure_path(state.space) or "q",
-                grid_shape=(grid_size, grid_size, grid_size),
-                normalize="mean",
+            # 1) Load experiment + TIFF frames (blocking I/O off the event loop)
+            _set_status("Loading experiment and TIFF frames...")
+            setup, ub, df = await loop.run_in_executor(
+                None, _load_experiment, loader_mode, crop_window
             )
 
-            _set_volume_data(volume, axes)
-            state.scalar_range = f"{float(np.nanmin(volume)):.4g} … {float(np.nanmax(volume)):.4g}"
-            state.volume_dims = f"{volume.shape[0]} × {volume.shape[1]} × {volume.shape[2]}"
-            state.export_path = str(Path(_ensure_path(state.export_path) or Path.cwd() / "rsm_output.vtr"))
-            state.status = "RSM volume built and ready."
-        except Exception as exc:
-            state.status = f"Error: {exc}"
+            # 2) Compute Q/HKL mapping
+            _set_status("Computing Q/HKL mapping...")
+            current_builder = await loop.run_in_executor(
+                None, _compute_builder, setup, ub, df
+            )
 
-    @ctrl.set("build_rsm")
-    def build_rsm(**kwargs):
-        _build_rsm()
+            # 3) Regrid to a 3D volume
+            grid_size = max(16, int(_float(state.grid_size, 90)))
+            _set_status("Regridding to 3D volume...")
+            volume, axes = await loop.run_in_executor(
+                None, _regrid_volume, current_builder, grid_size
+            )
+
+            # 4) Push into the renderer
+            _set_status("Updating 3D view...")
+            _set_volume_data(volume, axes)
+            state.scalar_range = (
+                f"{float(np.nanmin(volume)):.4g} … {float(np.nanmax(volume)):.4g}"
+            )
+            state.volume_dims = (
+                f"{volume.shape[0]} × {volume.shape[1]} × {volume.shape[2]}"
+            )
+            state.export_path = str(
+                Path(_ensure_path(state.export_path) or Path.cwd() / "rsm_output.vtr")
+            )
+            _set_status("RSM volume built and ready.")
+        except Exception as exc:
+            _set_status(f"Error: {exc}")
+
+    def _load_experiment(loader_mode, crop_window):
+        if loader_mode == "ISR":
+            spec_path = Path(_ensure_path(state.spec_path)).expanduser()
+            setup_path = Path(_ensure_path(state.setup_path)).expanduser()
+            tiff_dir = Path(_ensure_path(state.tiff_dir)).expanduser()
+            loader = RSMDataLoader_ISR(
+                str(spec_path),
+                str(setup_path),
+                str(tiff_dir),
+                use_dask=False,
+            )
+            setup, ub, df = loader.load()
+            if crop_window is not None:
+                df = _crop_dataframe_intensity(df, crop_window)
+                _adjust_setup_for_crop(setup, crop_window)
+        else:
+            setup_path = Path(_ensure_path(state.setup_path)).expanduser()
+            tiff_dir = Path(_ensure_path(state.tiff_dir)).expanduser()
+            loader = RSMDataloader_CMS(
+                str(setup_path),
+                str(tiff_dir),
+                crop_window=crop_window,
+            )
+            setup, ub, df = loader.load()
+            if crop_window is not None:
+                _adjust_setup_for_crop(setup, crop_window)
+        return setup, ub, df
+
+    def _compute_builder(setup, ub, df):
+        builder = RSMBuilder(setup, ub, df, ub_includes_2pi=True)
+        builder.compute_full(verbose=False)
+        return builder
+
+    def _regrid_volume(builder, grid_size):
+        return builder.regrid_xu(
+            space=_ensure_path(state.space) or "q",
+            grid_shape=(grid_size, grid_size, grid_size),
+            normalize="mean",
+        )
 
     @ctrl.set("export_vtr")
-    def export_vtr(**kwargs):
+    async def export_vtr(**kwargs):
         if current_volume is None or current_axes is None:
-            state.status = "No built volume available for export."
+            _set_status("No built volume available for export.")
             return
 
         output_path = Path(_ensure_path(state.export_path))
         if output_path.suffix.lower() != ".vtr":
             output_path = output_path.with_suffix(".vtr")
+        loop = asyncio.get_event_loop()
         try:
-            write_rsm_volume_to_vtr(current_volume, current_axes, str(output_path), binary=True, compress=True)
-            state.status = f"Exported VTR to {output_path}" 
+            _set_status(f"Exporting VTR to {output_path}...")
+            await loop.run_in_executor(
+                None,
+                lambda: write_rsm_volume_to_vtr(
+                    current_volume, current_axes, str(output_path), binary=True, compress=True
+                ),
+            )
             state.export_path = str(output_path)
+            _set_status(f"Exported VTR to {output_path}")
         except Exception as exc:
-            state.status = f"Export failed: {exc}"
+            _set_status(f"Export failed: {exc}")
 
     @ctrl.set("refresh_rendering")
     def refresh_rendering(**kwargs):
         _update_rendering()
+
+    def _fb_target_label(target: str) -> str:
+        labels = {
+            "setup_path": "YAML setup file",
+            "tiff_dir": "TIFF directory",
+            "spec_path": "SPEC file",
+            "export_path": "Export path",
+        }
+        return labels.get(_ensure_path(target), "File")
 
     def _fb_refresh(path: str):
         target_dir = Path(_ensure_path(path)).expanduser()
@@ -435,45 +496,71 @@ def create_server():
         else:
             target = _ensure_path(state.fb_target)
             if target:
-                setattr(state, target, _ensure_path(path))
+                value = _ensure_path(path)
+                setattr(state, target, value)
+                _set_status(f"{_fb_target_label(target)} set: {value}")
             state.fb_show = False
 
     def _fb_select_dir():
         target = _ensure_path(state.fb_target)
         if target:
-            setattr(state, target, _ensure_path(state.fb_cwd))
+            value = _ensure_path(state.fb_cwd)
+            setattr(state, target, value)
+            _set_status(f"{_fb_target_label(target)} set: {value}")
         state.fb_show = False
 
     def _fb_cancel():
         state.fb_show = False
 
     with DivLayout(server) as layout:
-        html.H2("Napari ResView Web") 
-        html.P("Load experiment profiles, build 3D RSM volumes, and inspect results in the browser.")
-        with html.Div( # main container that holds both the left control panel and the right 3D view, set to flex row layout to position them side by side
+        html.Style(
+            "* { box-sizing: border-box; }"
+            "html, body { margin: 0; height: 100%; font-family: sans-serif; }"
+            "input, select, button, textarea { font-family: inherit; }"
+        )
+        with html.Div(  # top header bar with the sidebar toggle and title
+            style=(
+                "display:flex; align-items:center; gap:12px; height:64px; flex:0 0 auto; "
+                "padding:8px 16px; border-bottom:1px solid #e0e0e0; "
+                "background:#ffffff; color:rgba(0,0,0,0.87); font-family:sans-serif;"
+            )
+        ):
+            html.Button( 
+                "\u2630",  # hamburger (3-bar) icon to hide/expand the sidebar
+                click="sidebar_open = !sidebar_open",
+                title="Toggle sidebar",
+                style=(
+                    "font-size:1.9rem; line-height:1; background:none; border:none; "
+                    "cursor:pointer; padding:4px 10px; color:rgba(0,0,0,0.87);"
+                ),
+            )
+            with html.Div():
+                html.H2("Napari ResView Web", style="margin:0; font-size:1.3rem;")
+                html.P(
+                    "Load experiment profiles, build 3D RSM volumes, and inspect results in the browser.",
+                    style="margin:0; font-size:0.9rem; color:#666;",
+                )
+        with html.Div(  # main container row holding the left control panel and the right 3D view
             style=( 
                 "display:flex; flex-direction:row; align-items:stretch; "
-                "height:100vh; overflow:hidden; margin:0; padding:0; "
+                "height:calc(100vh - 64px); overflow:hidden; margin:0; padding:0; "
                 "background:#ffffff; color:rgba(0,0,0,0.87); font-family:sans-serif;"
             )
         ):
             with html.Div(
-                style=( # sets style of the left control panel
-                    "width:360px; min-width:320px; height:100vh; padding:16px; overflow-y:auto; "
-                    "box-sizing:border-box; background:#ffffff; border-right:1px solid #e0e0e0;"
+                v_show="sidebar_open",
+                style=( # sets style of the left control panel; fixed width so boxes stay uniform
+                    "width:310px; min-width:310px; max-width:310px; height:100%; padding:16px; "
+                    "overflow-y:auto; overflow-x:hidden; background:#ffffff; border-right:1px solid #e0e0e0;"
                 )
             ):
-                # html.H2("Napari ResView Web") 
-                # html.P("Load experiment profiles, build 3D RSM volumes, and inspect results in the browser.")
                 html.Label("Loader mode")
-                html.Select(
+                with html.Select(
                     v_model=("loader_mode", ""),
-                    children=[
-                        html.Option("CMS", value="CMS"),
-                        html.Option("ISR", value="ISR"),
-                    ],
                     style="width:100%; margin-bottom:12px;",
-                )
+                ):
+                    html.Option("CMS", value="CMS")
+                    html.Option("ISR", value="ISR")
                 html.Label("Experiment YAML setup file")
                 html.Input(
                     v_model=("setup_path", os.path.join(os.path.expanduser("~"), ".rsm3d_defaults.yaml")), # the second arg sets the initial value in the input field, suggesting a default path to the user
@@ -499,14 +586,12 @@ def create_server():
                     style="width:100%; margin-bottom:12px; cursor:pointer;",
                 )
                 html.Label("Space")
-                html.Select(
+                with html.Select(
                     v_model=("space", ""),
-                    children=[
-                        html.Option("Q-space", value="q"),
-                        html.Option("HKL", value="hkl"),
-                    ],
                     style="width:100%; margin-bottom:12px;",
-                )
+                ):
+                    html.Option("Q-space", value="q")
+                    html.Option("HKL", value="hkl")
                 html.Label("Grid size")
                 html.Input(
                     v_model=("grid_size", ""),
@@ -516,11 +601,12 @@ def create_server():
                     style="width:100%; margin-bottom:12px;",
                 )
                 html.Label("Colormap")
-                html.Select(
+                with html.Select(
                     v_model=("colormap", ""),
-                    children=[html.Option(name, value=name) for name in COLORMAP_NAMES],
                     style="width:100%; margin-bottom:12px;",
-                )
+                ):
+                    for name in COLORMAP_NAMES:
+                        html.Option(name, value=name)
                 html.Label("Opacity scale")
                 html.Input(
                     v_model=("opacity_scale", ""),
@@ -531,64 +617,47 @@ def create_server():
                     style="width:100%; margin-bottom:12px;",
                 )
                 html.Label("Blend mode")
-                html.Select(
+                with html.Select(
                     v_model=("blend_mode", ""),
-                    children=[
-                        html.Option("Composite", value="0"),
-                        html.Option("Maximum intensity", value="1"),
-                    ],
                     style="width:100%; margin-bottom:12px;",
-                )
+                ):
+                    html.Option("Composite", value="0")
+                    html.Option("Maximum intensity", value="1")
                 html.Label("Crop enabled")
-                html.Div(
-                    children=[
-                        html.Input(v_model=("crop_enabled", ""), type="checkbox", style="margin-right:8px;"),
-                        html.Span("Enable crop window"),
-                    ],
-                    style="display:flex; align-items:center; margin-bottom:12px;",
-                )
+                with html.Div(style="display:flex; align-items:center; margin-bottom:12px;"):
+                    html.Input(v_model=("crop_enabled", ""), type="checkbox", style="margin-right:8px;")
+                    html.Span("Enable crop window")
                 html.Label("Crop rows")
-                html.Div(
-                    children=[
-                        html.Input(
-                            v_model=("crop_row_min", ""),
-                            type="number",
-                            placeholder="top",
-                            style="flex:1; margin-right:8px;",
-                        ),
-                        html.Input(
-                            v_model=("crop_row_max", ""),
-                            type="number",
-                            placeholder="bottom",
-                            style="flex:1;",
-                        ),
-                    ],
-                    style="display:flex; gap:8px; margin-bottom:12px;",
-                )
+                with html.Div(style="display:flex; gap:8px; margin-bottom:12px;"):
+                    html.Input(
+                        v_model=("crop_row_min", ""),
+                        type="number",
+                        placeholder="top",
+                        style="flex:1; margin-right:8px;",
+                    )
+                    html.Input(
+                        v_model=("crop_row_max", ""),
+                        type="number",
+                        placeholder="bottom",
+                        style="flex:1;",
+                    )
                 html.Label("Crop cols")
-                html.Div(
-                    children=[
-                        html.Input(
-                            v_model=("crop_col_min", ""),
-                            type="number",
-                            placeholder="left",
-                            style="flex:1; margin-right:8px;",
-                        ),
-                        html.Input(
-                            v_model=("crop_col_max", ""),
-                            type="number",
-                            placeholder="right",
-                            style="flex:1;",
-                        ),
-                    ],
-                    style="display:flex; gap:8px; margin-bottom:12px;",
-                )
-                html.Div(
-                    children=[
-                        html.Button("Load and build RSM", click="build_rsm", style="width:100%; margin-bottom:12px; padding:12px 8px;"),
-                        html.Button("Export VTR", click="export_vtr", style="width:100%; padding:12px 8px;"),
-                    ],
-                )
+                with html.Div(style="display:flex; gap:8px; margin-bottom:12px;"):
+                    html.Input(
+                        v_model=("crop_col_min", ""),
+                        type="number",
+                        placeholder="left",
+                        style="flex:1; margin-right:8px;",
+                    )
+                    html.Input(
+                        v_model=("crop_col_max", ""),
+                        type="number",
+                        placeholder="right",
+                        style="flex:1;",
+                    )
+                with html.Div():
+                    html.Button("Load and build RSM", click="build_rsm", style="width:100%; margin-bottom:12px; padding:12px 8px;")
+                    html.Button("Export VTR", click="export_vtr", style="width:100%; padding:12px 8px;")
                 html.Label("Export path")
                 html.Input(
                     v_model=("export_path", ""),
@@ -598,14 +667,13 @@ def create_server():
                 html.Hr(style="border-color:#e0e0e0; margin:16px 0;")
                 html.Strong("Status")
                 html.Pre(v_text="status", style="white-space:pre-wrap; background:#f5f5f5; padding:12px; border-radius:6px; margin-top:8px; color:rgba(0,0,0,0.87); border:1px solid #e0e0e0; min-height:90px;")
-                html.P(
-                    style="font-size:0.90rem; margin-top:12px; color:#666;",
-                    children=[
-                        f"Scalar range: ", html.Strong(v_text="scalar_range"), html.Br(),
-                        f"Dimensions: ", html.Strong(v_text="volume_dims"),
-                    ],
-                )
-            with html.Div(style="flex:1; min-width:0; height:100vh; background:#0f0f12; display:flex; flex-direction:column;"):
+                with html.P(style="font-size:0.90rem; margin-top:12px; color:#666;"):
+                    html.Span("Scalar range: ")
+                    html.Strong(v_text="scalar_range")
+                    html.Br()
+                    html.Span("Dimensions: ")
+                    html.Strong(v_text="volume_dims")
+            with html.Div(style="flex:1; min-width:0; height:100%; background:#0f0f12; display:flex; flex-direction:column;"):
                 # html.Div(
                 #     style="padding:12px 16px; color:#f5f5f5; background:#141414; border-bottom:1px solid #333;",
                 #     children=[
