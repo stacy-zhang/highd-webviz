@@ -448,7 +448,9 @@ def create_server():
         state.fb_show = False
 
     with DivLayout(server) as layout:
-        with html.Div(
+        html.H2("Napari ResView Web") 
+        html.P("Load experiment profiles, build 3D RSM volumes, and inspect results in the browser.")
+        with html.Div( # main container that holds both the left control panel and the right 3D view, set to flex row layout to position them side by side
             style=( 
                 "display:flex; flex-direction:row; align-items:stretch; "
                 "height:100vh; overflow:hidden; margin:0; padding:0; "
@@ -461,8 +463,8 @@ def create_server():
                     "box-sizing:border-box; background:#ffffff; border-right:1px solid #e0e0e0;"
                 )
             ):
-                html.H2("Napari ResView Web")
-                html.P("Load experiment profiles, build 3D RSM volumes, and inspect results in the browser.")
+                # html.H2("Napari ResView Web") 
+                # html.P("Load experiment profiles, build 3D RSM volumes, and inspect results in the browser.")
                 html.Label("Loader mode")
                 html.Select(
                     v_model=("loader_mode", ""),
