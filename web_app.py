@@ -1,5 +1,6 @@
 import os
 import asyncio
+import time
 from pathlib import Path
 from typing import Optional, Tuple
 import importlib
@@ -176,6 +177,7 @@ def create_server():
     state.setdefault("crop_col_max", 0)
     state.setdefault("export_path", str(Path.cwd() / "rsm_output.vtr"))
     state.setdefault("status", "Ready")
+    state.setdefault("status_log", ["Ready"])
     state.setdefault("scalar_range", "—")
     state.setdefault("volume_dims", "—")
     state.setdefault("ambient", 0.2)
@@ -233,13 +235,18 @@ def create_server():
     remote_view = None
 
     def _set_status(message: str):
-        """Update the Status box and push it to the client immediately.
+        """Append a message to the Status history and push it to the client.
 
-        Flushing is required so the message appears live; otherwise trame only
-        sends state changes to the browser once the event handler returns.
+        The log is reassigned (not mutated in place) so trame detects the
+        change, and flushed immediately so the message appears live; otherwise
+        trame only sends state changes to the browser once the event handler
+        returns.
         """
-        state.status = str(message)
-        state.flush("status")
+        timestamp = time.strftime("%H:%M:%S")
+        entry = f"[{timestamp}] {message}"
+        state.status_log = list(state.status_log or []) + [entry]
+        state.status = entry  # most recent message (kept for convenience)
+        state.flush("status_log", "status")
 
     def _update_rendering():
         if current_volume is None:
@@ -354,7 +361,7 @@ def create_server():
             state.export_path = str(
                 Path(_ensure_path(state.export_path) or Path.cwd() / "rsm_output.vtr")
             )
-            _set_status("RSM volume built and ready.")
+            _set_status("RSM volume built.")
         except Exception as exc:
             _set_status(f"Error: {exc}")
 
@@ -666,7 +673,28 @@ def create_server():
                 )
                 html.Hr(style="border-color:#e0e0e0; margin:16px 0;")
                 html.Strong("Status")
-                html.Pre(v_text="status", style="white-space:pre-wrap; background:#f5f5f5; padding:12px; border-radius:6px; margin-top:8px; color:rgba(0,0,0,0.87); border:1px solid #e0e0e0; min-height:90px;")
+                # Scrollable status history. `flex-direction:column-reverse`
+                # keeps the view pinned to the newest message (rendered last in
+                # the reversed list) while still letting the user scroll up to
+                # read past messages.
+                with html.Div(
+                    style=(
+                        "display:flex; flex-direction:column-reverse; "
+                        "max-height:180px; overflow-y:auto; background:#f5f5f5; "
+                        "padding:12px; border-radius:6px; margin-top:8px; "
+                        "color:rgba(0,0,0,0.87); border:1px solid #e0e0e0; "
+                        "min-height:90px;"
+                    ),
+                ):
+                    html.Div(
+                        "{{ line }}",
+                        v_for="(line, i) in [...status_log].reverse()",
+                        key="i",
+                        style=(
+                            "white-space:pre-wrap; font-family:monospace; "
+                            "font-size:0.85rem; padding:2px 0;"
+                        ),
+                    )
                 with html.P(style="font-size:0.90rem; margin-top:12px; color:#666;"):
                     html.Span("Scalar range: ")
                     html.Strong(v_text="scalar_range")
