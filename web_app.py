@@ -604,13 +604,13 @@ def create_server():
                     ],
                 )
             with html.Div(style="flex:1; min-width:0; height:100vh; background:#0f0f12; display:flex; flex-direction:column;"):
-                html.Div(
-                    style="padding:12px 16px; color:#f5f5f5; background:#141414; border-bottom:1px solid #333;",
-                    children=[
-                        html.H3("Live 3D View", style="margin:0 0 8px 0;"),
-                        html.Div("Rotate, zoom, and pan the reconstructed volume in the browser.", style="margin:0; font-size:0.95rem; color:#bbb;"),
-                    ],
-                )
+                # html.Div(
+                #     style="padding:12px 16px; color:#f5f5f5; background:#141414; border-bottom:1px solid #333;",
+                #     children=[
+                #         html.H3("Live 3D View", style="margin:0 0 8px 0;"),
+                #         html.Div("Rotate, zoom, and pan the reconstructed volume in the browser.", style="margin:0; font-size:0.95rem; color:#bbb;"),
+                #     ],
+                # )
                 remote_view
 
         # File browser modal dialog
