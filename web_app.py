@@ -525,8 +525,12 @@ def create_server():
         state.fb_show = False
 
     with DivLayout(server) as layout:
-        remote_view = VtkRemoteView(render_window, ref="remote_view") 
-        # remote_view is defined twice because we need to assign it inside the UI context manager where we have access to the server, but we also need to reference it in the _update_rendering function defined above. The first assignment is just a placeholder to allow the reference; the second assignment is the actual instantiation of the VtkRemoteView widget.
+        # NOTE: VtkRemoteView is instantiated later, inside the right-hand 3D
+        # view panel (which has a defined non-zero size). Do NOT create a
+        # VtkRemoteView here at the top of the layout: a stray view with no
+        # sized container reports a 0x0 client geometry, which makes trame
+        # resize the underlying X render window to 0x0 and triggers a fatal
+        # "X_ConfigureWindow BadValue (0x0)" error that kills the server.
         html.Style(
             "* { box-sizing: border-box; }"
             "html, body { margin: 0; height: 100%; font-family: sans-serif; }"
