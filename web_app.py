@@ -14,6 +14,7 @@ from vtkmodules.vtkRenderingCore import (
     vtkColorTransferFunction,
     vtkRenderer,
     vtkRenderWindow,
+    vtkRenderWindowInteractor,
     vtkVolume,
     vtkVolumeProperty,
 )
@@ -119,6 +120,38 @@ def _apply_opacity_function(
     opacity_tf.AddPoint(hi, min(1.0, 0.8 * opacity_scale))
 
 
+def _log1p_clip(a: np.ndarray) -> np.ndarray:
+    """Log-compress the volume for display (mirrors the napari path).
+
+    RSM intensities span many orders of magnitude, so a raw linear mapping
+    leaves everything but the brightest Bragg peak fully transparent. napari
+    shows the data via log1p(max(a, 0)); we do the same before handing the
+    volume to VTK.
+    """
+    return np.log1p(np.maximum(np.asarray(a, dtype=np.float32), 0.0))
+
+
+def _robust_percentiles(
+    a: np.ndarray, prc: Tuple[float, float] = (1.0, 99.8)
+) -> Tuple[float, float]:
+    """Robust (lo, hi) contrast limits, ignoring non-finite values.
+
+    Matches napari's contrast-limit computation so the web app frames the
+    transfer functions over the meaningful data range instead of the full
+    [min, max], which a single outlier voxel would otherwise dominate.
+    """
+    a = np.asarray(a)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return (0.0, 1.0)
+    lo, hi = np.percentile(a, prc)
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo, hi = float(np.min(a)), float(np.max(a))
+        if hi <= lo:
+            hi = lo + 1.0
+    return float(lo), float(hi)
+
+
 def _crop_window_from_state(state) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
     if not getattr(state, "crop_enabled", False):
         return None
@@ -166,6 +199,9 @@ def create_server():
     state.setdefault("spec_path", "")
     state.setdefault("space", "q")
     state.setdefault("grid_size", 90)
+    # # Streaming (low-memory) build: compute per-pixel Q one frame at a time and
+    # # bin directly, instead of allocating the full (Nframes, ny, nx, 3) cube.
+    # state.setdefault("stream_build", True)
     state.setdefault("blend_mode", 0)
     state.setdefault("shade", True)
     state.setdefault("opacity_scale", 1.0)
@@ -204,6 +240,13 @@ def create_server():
     render_window.SetSize(1024, 768)
     render_window.SetOffScreenRendering(1)
 
+    # trame-vtk's push_image() calls render_window.GetInteractor().EnableRenderOff(),
+    # so the render window must have an interactor attached even though we render
+    # off-screen and never start an event loop on it.
+    interactor = vtkRenderWindowInteractor()
+    interactor.SetRenderWindow(render_window)
+    interactor.Initialize()
+
     volume_mapper = vtkSmartVolumeMapper()
     volume_mapper.SetBlendModeToComposite()
 
@@ -230,7 +273,8 @@ def create_server():
     current_volume = None
     current_axes = None
     current_builder = None
-    
+    # Robust display range (log-scaled) used to build the transfer functions.
+    render_range = None
     # Defer VtkRemoteView creation until the UI context is built
     remote_view = None
     # how to instantiate remote_view: it needs the render_window, but that needs to be created after the trame server is running. So we create it here as None, and then assign it inside the DivLayout context manager where we have access to the server.
@@ -264,9 +308,14 @@ def create_server():
         else:
             volume_mapper.SetBlendModeToComposite()
 
-        scalar_range = None
-        if current_volume is not None:
-            scalar_range = (float(np.nanmin(current_volume)), float(np.nanmax(current_volume)))
+        # Use the robust log-scaled display range computed in _set_volume_data
+        # (falls back to the raw min/max if unavailable).
+        scalar_range = render_range
+        if scalar_range is None and current_volume is not None:
+            scalar_range = (
+                float(np.nanmin(current_volume)),
+                float(np.nanmax(current_volume)),
+            )
 
         _apply_color_transfer_function(color_tf, _ensure_path(state.colormap), scalar_range)
         _apply_opacity_function(opacity_tf, scalar_range, _float(state.opacity_scale, 1.0))
@@ -277,11 +326,19 @@ def create_server():
             remote_view.update()
 
     def _set_volume_data(volume: np.ndarray, axes: Tuple[np.ndarray, np.ndarray, np.ndarray]):
-        nonlocal current_volume, current_axes
+        nonlocal current_volume, current_axes, render_range
         current_volume = np.asarray(volume, dtype=np.float32)
         current_axes = axes
+
+        # Log-compress for display so the high-dynamic-range RSM is visible,
+        # and derive the transfer-function range from robust percentiles of the
+        # log-scaled data (mirrors the napari viewer). The raw current_volume is
+        # kept untouched for VTR export.
+        display_volume = _log1p_clip(current_volume)
+        render_range = _robust_percentiles(display_volume, (1.0, 99.8))
+
         image = vtkImageData()
-        nx, ny, nz = current_volume.shape
+        nx, ny, nz = display_volume.shape
         image.SetDimensions(nx, ny, nz)
 
         spacings = []
@@ -299,7 +356,7 @@ def create_server():
         image.SetOrigin(*origin)
 
         vtk_array = numpy_support.numpy_to_vtk(
-            np.ascontiguousarray(current_volume, dtype=np.float32).ravel(order="F"),
+            np.ascontiguousarray(display_volume, dtype=np.float32).ravel(order="F"),
             deep=True,
             array_type=numpy_support.get_vtk_array_type(np.float32),
         )
@@ -340,6 +397,42 @@ def create_server():
             setup, ub, df = await loop.run_in_executor(
                 None, _load_experiment, loader_mode, crop_window
             )
+
+            # grid_size = max(16, int(_float(state.grid_size, 90)))
+            # if bool(state.stream_build):
+            #     # Memory-frugal streaming path. Constructing the builder is
+            #     # cheap (it only configures the xrayutilities geometry); the
+            #     # expensive per-pixel mapping happens inside the two streaming
+            #     # passes below, one frame at a time, so the full Q cube is
+            #     # never held in RAM.
+            #     _set_status("Preparing reciprocal-space mapping...")
+            #     current_builder = await loop.run_in_executor(
+            #         None, _build_builder, setup, ub, df
+            #     )
+
+            #     # 2a) Pass 1: scan the data extent to fix the grid bins.
+            #     _set_status("Scanning data extent (pass 1/2)...")
+            #     ranges = await loop.run_in_executor(
+            #         None, _compute_ranges, current_builder
+            #     )
+
+            #     # 2b) Pass 2: bin every frame into the 3D grid.
+            #     _set_status("Binning frames into 3D grid (pass 2/2)...")
+            #     volume, axes = await loop.run_in_executor(
+            #         None, _regrid_stream, current_builder, grid_size, ranges
+            #     )
+            # else:
+            #     # Original path: materializes the full Q/HKL cube. Faster for
+            #     # small datasets but can exhaust RAM on large ones.
+            #     _set_status("Computing Q/HKL mapping...")
+            #     current_builder = await loop.run_in_executor(
+            #         None, _compute_builder, setup, ub, df
+            #     )
+
+            #     _set_status("Regridding to 3D volume...")
+            #     volume, axes = await loop.run_in_executor(
+            #         None, _regrid_volume, current_builder, grid_size
+            #     )
 
             # 2) Compute Q/HKL mapping
             _set_status("Computing Q/HKL mapping...")
@@ -409,6 +502,23 @@ def create_server():
             grid_shape=(grid_size, grid_size, grid_size),
             normalize="mean",
         )
+
+    # # --- Streaming (low-memory) build helpers -------------------------------
+    # def _build_builder(setup, ub, df):
+    #     # Cheap: only sets up the xrayutilities QConversion geometry; does NOT
+    #     # compute or allocate the per-pixel Q/HKL arrays.
+    #     return RSMBuilder(setup, ub, df, ub_includes_2pi=True)
+
+    # def _compute_ranges(builder):
+    #     return builder.compute_ranges(_ensure_path(state.space) or "q")
+
+    # def _regrid_stream(builder, grid_size, ranges):
+    #     return builder.regrid_stream(
+    #         space=_ensure_path(state.space) or "q",
+    #         grid_shape=(grid_size, grid_size, grid_size),
+    #         ranges=ranges,
+    #         normalize="mean",
+    #     )
 
     @ctrl.set("export_vtr")
     async def export_vtr(**kwargs):
@@ -566,10 +676,11 @@ def create_server():
             )
         ):
             with html.Div(
+                id="control_panel",
                 v_show="sidebar_open",
-                style=( # sets style of the left control panel; fixed width so boxes stay uniform
-                    "width:310px; min-width:310px; max-width:310px; height:100%; padding:16px; "
-                    "overflow-y:auto; overflow-x:hidden; background:#ffffff; border-right:1px solid #e0e0e0;"
+                style=( # left control panel: width is adjusted via the drag grip on its right edge
+                    "width:310px; min-width:200px; max-width:50vw; flex:none; height:100%; padding:16px; "
+                    "overflow:auto; background:#ffffff;"
                 )
             ):
                 html.Label("Loader mode")
@@ -618,6 +729,10 @@ def create_server():
                     step="8",
                     style="width:100%; margin-bottom:12px;",
                 )
+                # html.Label("Low-memory build")
+                # with html.Div(style="display:flex; align-items:center; margin-bottom:12px;"):
+                #     html.Input(v_model=("stream_build", ""), type="checkbox", style="margin-right:8px;")
+                #     html.Span("Stream frames (avoids large RAM use)")
                 html.Label("Colormap")
                 with html.Select(
                     v_model=("colormap", ""),
@@ -651,13 +766,13 @@ def create_server():
                         v_model=("crop_row_min", ""),
                         type="number",
                         placeholder="top",
-                        style="flex:1; margin-right:8px;",
+                        style="flex:1; min-width:0;",
                     )
                     html.Input(
                         v_model=("crop_row_max", ""),
                         type="number",
                         placeholder="bottom",
-                        style="flex:1;",
+                        style="flex:1; min-width:0;",
                     )
                 html.Label("Crop cols")
                 with html.Div(style="display:flex; gap:8px; margin-bottom:12px;"):
@@ -665,22 +780,22 @@ def create_server():
                         v_model=("crop_col_min", ""),
                         type="number",
                         placeholder="left",
-                        style="flex:1; margin-right:8px;",
+                        style="flex:1; min-width:0;",
                     )
                     html.Input(
                         v_model=("crop_col_max", ""),
                         type="number",
                         placeholder="right",
-                        style="flex:1;",
+                        style="flex:1; min-width:0;",
                     )
                 with html.Div():
                     html.Button("Load and build RSM", click=ctrl.build_rsm, style="width:100%; margin-bottom:12px; padding:12px 8px;")
-                    html.Button("Export VTR", click=ctrl.export_vtr, style="width:100%; padding:12px 8px;")
+                    html.Button("Export VTR", click=ctrl.export_vtr, style="width:100%; margin-bottom:12px; padding:12px 8px;")
                 html.Label("Export path")
                 html.Input(
                     v_model=("export_path", ""),
                     placeholder="/path/to/output.vtr",
-                    style="width:100%; margin-top:12px; margin-bottom:12px;",
+                    style="width:100%; margin-top:12px;",
                 )
                 html.Hr(style="border-color:#e0e0e0; margin:16px 0;")
                 html.Strong("Status")
@@ -712,6 +827,43 @@ def create_server():
                     html.Br()
                     html.Span("Dimensions: ")
                     html.Strong(v_text="volume_dims")
+            # Drag grip: click-and-drag the vertical 3-dot handle to resize the
+            # left panel. Resizing is handled entirely client-side (no server
+            # round-trip) by adjusting the panel element's width on pointermove,
+            # clamped between 200px and half the viewport width.
+            html.Div(
+                "\u22EE",
+                v_show="sidebar_open",
+                title="Drag to resize panel",
+                mousedown=(
+                    "$event.preventDefault();"
+                    "var p=document.getElementById('control_panel');"
+                    "if(!p){return;}"
+                    "var sx=$event.clientX;"
+                    "var sw=p.getBoundingClientRect().width;"
+                    "function mv(e){"
+                    "var w=Math.max(200, Math.min(window.innerWidth/2, sw+e.clientX-sx));"
+                    "p.style.width=w+'px';"
+                    "}"
+                    "function up(){"
+                    "document.removeEventListener('pointermove',mv);"
+                    "document.removeEventListener('pointerup',up);"
+                    "document.body.style.userSelect='';"
+                    "document.body.style.cursor='';"
+                    "}"
+                    "document.body.style.userSelect='none';"
+                    "document.body.style.cursor='col-resize';"
+                    "document.addEventListener('pointermove',mv);"
+                    "document.addEventListener('pointerup',up);"
+                ),
+                style=(
+                    "flex:0 0 16px; align-self:stretch; cursor:col-resize; "
+                    "display:flex; align-items:center; justify-content:center; "
+                    "background:#f0f0f0; border-right:1px solid #e0e0e0; "
+                    "color:#9e9e9e; font-size:1.2rem; line-height:1; "
+                    "user-select:none; touch-action:none;"
+                ),
+            )
             with html.Div(style="flex:1; min-width:0; height:100%; background:#0f0f12; display:flex; flex-direction:column;"):
                 # Instantiate the remote view that streams the off-screen VTK
                 # render window to the browser. This reassigns the `remote_view`
