@@ -2,6 +2,7 @@ import os
 import asyncio
 import time
 from pathlib import Path
+import pathlib
 from typing import Optional, Tuple
 import importlib
 import sys
@@ -188,13 +189,29 @@ def _crop_dataframe_intensity(df, crop_window):
     df["intensity"] = [frame[r0:r1, c0:c1] for frame in df["intensity"]]
     return df
 
+# partly copied from resview_widget.py
+DEFAULTS_ENV = "RSM3D_DEFAULTS_YAML"
+# The bundled defaults YAML lives inside the napari_resview package, not next to
+# web_app.py. Use PACKAGE_PATH so the auto-filled setup path points at the file
+# that actually exists (web_app.py sits one directory above the package, so
+# Path(__file__).with_name(...) would resolve to a non-existent root-level file).
+os.environ.setdefault(
+    DEFAULTS_ENV,
+    # str(pathlib.Path(__file__).with_name("rsm3d_defaults.yaml").resolve()),
+    str(PACKAGE_PATH / "rsm3d_defaults.yaml"),
+)
+def yaml_path() -> str: # Allow override of defaults path via environment variable, else use ~/.rsm3d_defaults.yaml
+    p = os.environ.get(DEFAULTS_ENV, "").strip()
+    if p:
+        return os.path.abspath(os.path.expanduser(p))
+    return os.path.join(os.path.expanduser("~"), ".rsm3d_defaults.yaml")
 
 def create_server():
     server = get_server(name="napari_resview_web", client_type="vue3")
     state, ctrl = server.state, server.controller
 
     state.setdefault("loader_mode", "CMS")
-    state.setdefault("setup_path", "")
+    state.setdefault("setup_path", yaml_path())
     state.setdefault("tiff_dir", "")
     state.setdefault("spec_path", "")
     state.setdefault("space", "q")
@@ -410,13 +427,13 @@ def create_server():
             #         None, _build_builder, setup, ub, df
             #     )
 
-            #     # 2a) Pass 1: scan the data extent to fix the grid bins.
-            #     _set_status("Scanning data extent (pass 1/2)...")
-            #     ranges = await loop.run_in_executor(
-            #         None, _compute_ranges, current_builder
-            #     )
+                # # 2a) Pass 1: scan the data extent to fix the grid bins.
+                # _set_status("Scanning data extent (pass 1/2)...")
+                # ranges = await loop.run_in_executor(
+                #     None, _compute_ranges, current_builder
+                # )
 
-            #     # 2b) Pass 2: bin every frame into the 3D grid.
+                # 2b) Pass 2: bin every frame into the 3D grid.
             #     _set_status("Binning frames into 3D grid (pass 2/2)...")
             #     volume, axes = await loop.run_in_executor(
             #         None, _regrid_stream, current_builder, grid_size, ranges
@@ -503,7 +520,7 @@ def create_server():
             normalize="mean",
         )
 
-    # # --- Streaming (low-memory) build helpers -------------------------------
+    # --- Streaming (low-memory) build helpers -------------------------------
     # def _build_builder(setup, ub, df):
     #     # Cheap: only sets up the xrayutilities QConversion geometry; does NOT
     #     # compute or allocate the per-pixel Q/HKL arrays.
@@ -692,7 +709,7 @@ def create_server():
                     html.Option("ISR", value="ISR")
                 html.Label("Experiment YAML setup file")
                 html.Input(
-                    v_model=("setup_path", os.path.join(os.path.expanduser("~"), ".rsm3d_defaults.yaml")), # the second arg sets the initial value in the input field, suggesting a default path to the user
+                    v_model=("setup_path", ""), # the second arg sets the initial value in the input field
                     placeholder="Select a YAML setup file",
                     readonly=True,
                     click=(_fb_open, "['setup_path', 'file']"),
