@@ -707,14 +707,14 @@ def create_server():
                 ):
                     html.Option("CMS", value="CMS")
                     html.Option("ISR", value="ISR")
-                html.Label("Experiment YAML setup file")
-                html.Input(
-                    v_model=("setup_path", ""), # the second arg sets the initial value in the input field
-                    placeholder="Select a YAML setup file",
-                    readonly=True,
-                    click=(_fb_open, "['setup_path', 'file']"),
-                    style="width:100%; margin-bottom:12px; cursor:pointer;",
-                )
+                # html.Label("Experiment YAML setup file")
+                # html.Input(
+                #     v_model=("setup_path", ""), # the second arg sets the initial value in the input field
+                #     placeholder="Select a YAML setup file",
+                #     readonly=True,
+                #     click=(_fb_open, "['setup_path', 'file']"),
+                #     style="width:100%; margin-bottom:12px; cursor:pointer;",
+                # )
                 html.Label("TIFF directory")
                 html.Input(
                     v_model=("tiff_dir", ""),
