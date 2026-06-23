@@ -760,137 +760,155 @@ def create_server():
                 _set_status("Missing SPEC file for ISR mode.")
                 return
 
-        crop_window = _crop_window_from_state(state)
         loop = asyncio.get_event_loop()
-
         try:
-            # 1) Load experiment + TIFF frames (blocking I/O off the event loop)
             _set_status("Loading experiment and TIFF frames...")
-            setup, ub, df = await loop.run_in_executor(
-                None, _load_experiment, loader_mode, crop_window
+            setup, ub, df, frames = await loop.run_in_executor(
+                None, _load_experiment, loader_mode
             )
 
-            # grid_size = max(16, int(_float(state.grid_size, 90)))
-            # if bool(state.stream_build):
-            #     # Memory-frugal streaming path. Constructing the builder is
-            #     # cheap (it only configures the xrayutilities geometry); the
-            #     # expensive per-pixel mapping happens inside the two streaming
-            #     # passes below, one frame at a time, so the full Q cube is
-            #     # never held in RAM.
-            #     _set_status("Preparing reciprocal-space mapping...")
-            #     current_builder = await loop.run_in_executor(
-            #         None, _build_builder, setup, ub, df
-            #     )
+            current_setup, current_ub, current_df, current_frames = setup, ub, df, frames
+            current_builder = None
+            regrid_volume = None
+            regrid_axes = None
+            _populate_setup_fields(setup, frames)
+            n = len(frames) if frames else 0
+            _set_status(f"Data loaded ({n} frame(s)). Ready to build.")
+        except asyncio.CancelledError:
+            _set_status("Load cancelled.")
+        except Exception as exc:
+            _set_status(f"Load error: {exc}")
 
-                # # 2a) Pass 1: scan the data extent to fix the grid bins.
-                # _set_status("Scanning data extent (pass 1/2)...")
-                # ranges = await loop.run_in_executor(
-                #     None, _compute_ranges, current_builder
-                # )
-
-                # 2b) Pass 2: bin every frame into the 3D grid.
-            #     _set_status("Binning frames into 3D grid (pass 2/2)...")
-            #     volume, axes = await loop.run_in_executor(
-            #         None, _regrid_stream, current_builder, grid_size, ranges
-            #     )
-            # else:
-            #     # Original path: materializes the full Q/HKL cube. Faster for
-            #     # small datasets but can exhaust RAM on large ones.
-            #     _set_status("Computing Q/HKL mapping...")
-            #     current_builder = await loop.run_in_executor(
-            #         None, _compute_builder, setup, ub, df
-            #     )
-
-            #     _set_status("Regridding to 3D volume...")
-            #     volume, axes = await loop.run_in_executor(
-            #         None, _regrid_volume, current_builder, grid_size
-            #     )
-
-            # 2) Compute Q/HKL mapping
+    @ctrl.set("load_data")
+    def load_data(**kwargs):
+        _track(_do_load_data())
+        
+    async def _do_build_rsm():
+        nonlocal current_builder
+        if current_setup is None or current_df is None:
+            _set_status("Load data first.")
+            return
+        _apply_setup_overrides(current_setup)
+        loop = asyncio.get_event_loop()
+        try:
             _set_status("Computing Q/HKL mapping...")
             current_builder = await loop.run_in_executor(
-                None, _compute_builder, setup, ub, df
+                None, _compute_builder, current_setup, current_ub, current_df
             )
-
-            # 3) Regrid to a 3D volume
-            grid_size = max(16, int(_float(state.grid_size, 90)))
-            _set_status("Regridding to 3D volume...")
-            volume, axes = await loop.run_in_executor(
-                None, _regrid_volume, current_builder, grid_size
-            )
-
-            # 4) Push into the renderer
-            _set_status("Updating 3D view...")
-            _set_volume_data(volume, axes)
-            state.scalar_range = (
-                f"{float(np.nanmin(volume)):.4g} … {float(np.nanmax(volume)):.4g}"
-            )
-            state.volume_dims = (
-                f"{volume.shape[0]} × {volume.shape[1]} × {volume.shape[2]}"
-            )
-            state.export_path = str(
-                Path(_ensure_path(state.export_path) or Path.cwd() / "rsm_output.vtr")
-            )
-            _set_status("RSM volume built.")
+            _set_status("RSM map built. Ready to regrid.")
+        except asyncio.CancelledError:
+            _set_status("Build cancelled.")
         except Exception as exc:
-            _set_status(f"Error: {exc}")
+            _set_status(f"Build error: {exc}")
 
-    def _load_experiment(loader_mode, crop_window):
-        if loader_mode == "ISR":
-            spec_path = Path(_ensure_path(state.spec_path)).expanduser()
-            setup_path = Path(_ensure_path(state.setup_path)).expanduser()
-            tiff_dir = Path(_ensure_path(state.tiff_dir)).expanduser()
-            loader = RSMDataLoader_ISR(
-                str(spec_path),
-                str(setup_path),
-                str(tiff_dir),
-                use_dask=False,
+        @ctrl.set("build_rsm")
+        def build_rsm(**kwargs):
+            _track(_do_build_rsm())
+
+        async def _do_regrid():
+            nonlocal regrid_volume, regrid_axes
+            if current_builder is None:
+                _set_status("Build the RSM map first.")
+                return
+            loop = asyncio.get_event_loop()
+            try:
+                grid_size = max(16, int(_float(state.grid_size, 90)))
+                _set_status(f"Regridding to {grid_size}³ volume...")
+                volume, axes = await loop.run_in_executor(
+                    None, _regrid_volume, current_builder, grid_size
+                )
+                regrid_volume, regrid_axes = volume, axes
+                state.scalar_range = (
+                    f"{float(np.nanmin(volume)):.4g} … {float(np.nanmax(volume)):.4g}"
+                )
+                state.volume_dims = (
+                    f"{volume.shape[0]} × {volume.shape[1]} × {volume.shape[2]}"
+                )
+                _set_status("Regrid complete. Use View RSM to display.")
+            except asyncio.CancelledError:
+                _set_status("Regrid cancelled.")
+            except Exception as exc:
+                _set_status(f"Regrid error: {exc}")
+
+    @ctrl.set("regrid")
+    def regrid(**kwargs):
+        _track(_do_regrid())
+
+    @ctrl.set("view_rsm")
+    def view_rsm(**kwargs):
+        if regrid_volume is None or regrid_axes is None:
+            _set_status("Regrid first.")
+            return
+        _set_status("Updating 3D view...")
+        _set_volume_data(regrid_volume, regrid_axes)
+        _set_status("RSM volume displayed.")
+
+    @ctrl.set("view_intensity")
+    def view_intensity(**kwargs):
+        if not current_frames:
+            _set_status("No intensity frames. Load data first.")
+            return
+        try:
+            stack = np.asarray(
+                [np.asarray(f, dtype=np.float32) for f in current_frames],
+                dtype=np.float32,
             )
-            setup, ub, df = loader.load()
-            if crop_window is not None:
-                df = _crop_dataframe_intensity(df, crop_window)
-                _adjust_setup_for_crop(setup, crop_window)
-        else:
-            setup_path = Path(_ensure_path(state.setup_path)).expanduser()
-            tiff_dir = Path(_ensure_path(state.tiff_dir)).expanduser()
-            loader = RSMDataloader_CMS(
-                str(setup_path),
-                str(tiff_dir),
-                crop_window=crop_window,
-            )
-            setup, ub, df = loader.load()
-            if crop_window is not None:
-                _adjust_setup_for_crop(setup, crop_window)
-        return setup, ub, df
-
-    def _compute_builder(setup, ub, df):
-        builder = RSMBuilder(setup, ub, df, ub_includes_2pi=True)
-        builder.compute_full(verbose=False)
-        return builder
-
-    def _regrid_volume(builder, grid_size):
-        return builder.regrid_xu(
-            space=_ensure_path(state.space) or "q",
-            grid_shape=(grid_size, grid_size, grid_size),
-            normalize="mean",
+        except Exception as exc:
+            _set_status(f"Intensity view error: {exc}")
+            return
+        nz, ny, nx = stack.shape
+        axes = (
+            np.arange(nz, dtype=float),
+            np.arange(ny, dtype=float),
+            np.arange(nx, dtype=float),
         )
+        # _set_volume_data expects (nx, ny, nz) ordering of the array.
+        _set_status("Displaying raw intensity frames...")
+        _set_volume_data(np.transpose(stack, (2, 1, 0)), axes)
+        _set_status(f"Intensity stack displayed ({nz} frame(s)).")
 
-    # --- Streaming (low-memory) build helpers -------------------------------
-    # def _build_builder(setup, ub, df):
-    #     # Cheap: only sets up the xrayutilities QConversion geometry; does NOT
-    #     # compute or allocate the per-pixel Q/HKL arrays.
-    #     return RSMBuilder(setup, ub, df, ub_includes_2pi=True)
+    @ctrl.set("crop_from_roi")
+    def crop_from_roi(**kwargs):
+        nonlocal current_df, current_frames, current_builder, regrid_volume, regrid_axes
+        if current_df is None or not current_frames:
+            _set_status("Load data before cropping.")
+            return
+        try:
+            r0 = int(state.crop_row_min)
+            r1 = int(state.crop_row_max)
+            c0 = int(state.crop_col_min)
+            c1 = int(state.crop_col_max)
+        except (TypeError, ValueError):
+            _set_status("Invalid crop bounds.")
+            return
+        if r1 <= r0 or c1 <= c0:
+            _set_status("Crop bounds must have positive area (max > min).")
+            return
+        crop_window = ((r0, r1), (c0, c1))
+        try:
+            current_df = _crop_dataframe_intensity(current_df, crop_window)
+            current_frames = list(current_df["intensity"])
+            if current_setup is not None:
+                _adjust_setup_for_crop(current_setup, crop_window)
+                _populate_setup_fields(current_setup, current_frames)
+            # Invalidate downstream products built from the un-cropped data.
+            current_builder = None
+            regrid_volume = None
+            regrid_axes = None
+            _set_status(
+                f"Crop applied: rows [{r0}, {r1}), cols [{c0}, {c1}). Rebuild required."
+            )
+        except Exception as exc:
+            _set_status(f"Crop error: {exc}")
 
-    # def _compute_ranges(builder):
-    #     return builder.compute_ranges(_ensure_path(state.space) or "q")
-
-    # def _regrid_stream(builder, grid_size, ranges):
-    #     return builder.regrid_stream(
-    #         space=_ensure_path(state.space) or "q",
-    #         grid_shape=(grid_size, grid_size, grid_size),
-    #         ranges=ranges,
-    #         normalize="mean",
-    #     )
+    @ctrl.set("stop_task")
+    def stop_task(**kwargs):
+        nonlocal current_task
+        if current_task is not None and not current_task.done():
+            current_task.cancel()
+            _set_status("Stop requested.")
+        else:
+            _set_status("Nothing running.")
 
     @ctrl.set("export_vtr")
     async def export_vtr(**kwargs):
