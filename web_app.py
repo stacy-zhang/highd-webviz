@@ -1079,120 +1079,216 @@ def create_server():
                     "overflow:auto; background:#ffffff;"
                 )
             ):
-                html.Label("Loader mode")
-                with html.Select(
-                    v_model=("loader_mode", ""),
-                    style="width:100%; margin-bottom:12px;",
+                # ---- Accordion helpers ------------------------------------
+                # Each tab is a horizontal bar (name on the left, arrow on the
+                # right). Clicking a bar expands that tab and collapses any
+                # other, so only 0 or 1 tab is open at a time.
+                _bar = (
+                    "display:flex; align-items:center; justify-content:space-between; "
+                    "cursor:pointer; padding:12px 14px; margin-bottom:6px; "
+                    "background:#f0f0f3; border:1px solid #dcdce0; border-radius:6px; "
+                    "font-weight:600; user-select:none;"
+                )
+                _panel = (
+                    "border:1px solid #e0e0e0; border-top:none; border-radius:0 0 6px 6px; "
+                    "padding:14px; margin:-6px 0 10px 0; background:#fbfbfc;"
+                )
+                _lbl = "display:block; margin-top:10px; font-size:0.85rem; color:#444;"
+                _inp = "width:100%; margin-top:4px;"
+                _btn = "flex:1; padding:10px 8px; cursor:pointer;"
+
+                # ===================== DATA TAB =====================
+                with html.Div(
+                    style=_bar, click="open_tab = open_tab === 'data' ? '' : 'data'"
                 ):
-                    html.Option("CMS", value="CMS")
-                    html.Option("ISR", value="ISR")
-                # html.Label("Experiment YAML setup file")
-                # html.Input(
-                #     v_model=("setup_path", ""), # the second arg sets the initial value in the input field
-                #     placeholder="Select a YAML setup file",
-                #     readonly=True,
-                #     click=(_fb_open, "['setup_path', 'file']"),
-                #     style="width:100%; margin-bottom:12px; cursor:pointer;",
-                # )
-                html.Label("TIFF directory")
-                html.Input(
-                    v_model=("tiff_dir", ""),
-                    placeholder="Select a TIFF directory",
-                    readonly=True,
-                    click=(_fb_open, "['tiff_dir', 'dir']"),
-                    style="width:100%; margin-bottom:12px; cursor:pointer;",
-                )
-                html.Label("SPEC file (ISR only)")
-                html.Input(
-                    v_model=("spec_path", ""),
-                    placeholder="Select a SPEC file",
-                    readonly=True,
-                    click=(_fb_open, "['spec_path', 'file']"),
-                    style="width:100%; margin-bottom:12px; cursor:pointer;",
-                )
-                html.Label("Space")
-                with html.Select(
-                    v_model=("space", ""),
-                    style="width:100%; margin-bottom:12px;",
+                    html.Span("Data")
+                    html.Span("{{ open_tab === 'data' ? '\u25BC' : '\u25B6' }}")
+                with html.Div(v_show="open_tab === 'data'", style=_panel):
+                    html.Label("Beamline / loader mode", style=_lbl)
+                    with html.Select(v_model=("loader_mode", ""), style=_inp):
+                        html.Option("CMS", value="CMS")
+                        html.Option("ISR", value="ISR")
+
+                    html.Label("TIFF directory", style=_lbl)
+                    html.Input(
+                        v_model=("tiff_dir", ""),
+                        placeholder="Select a TIFF directory",
+                        readonly=True,
+                        click=(_fb_open, "['tiff_dir', 'dir']"),
+                        style=_inp + " cursor:pointer;",
+                    )
+                    with html.Div(v_show="loader_mode === 'ISR'"):
+                        html.Label("SPEC file (ISR only)", style=_lbl)
+                        html.Input(
+                            v_model=("spec_path", ""),
+                            placeholder="Select a SPEC file",
+                            readonly=True,
+                            click=(_fb_open, "['spec_path', 'file']"),
+                            style=_inp + " cursor:pointer;",
+                        )
+
+                    # CMS metadata
+                    with html.Div(v_show="loader_mode === 'CMS'"):
+                        html.Strong("CMS metadata", style="display:block; margin-top:14px;")
+                        html.Label("Angle step (\u00b0)", style=_lbl)
+                        html.Input(
+                            v_model=("cms_angle_step", ""),
+                            type="number", step="0.01",
+                            style=_inp,
+                        )
+
+                    # Experimental setup
+                    html.Strong("Experimental Setup", style="display:block; margin-top:14px;")
+                    html.Label("Distance (m)", style=_lbl)
+                    html.Input(v_model=("exp_distance", ""), type="number", step="1e-6", style=_inp)
+                    html.Label("Pitch (m)", style=_lbl)
+                    html.Input(v_model=("exp_pitch", ""), type="number", step="1e-9", style=_inp)
+                    html.Label("Detector height (px)", style=_lbl)
+                    html.Input(v_model=("exp_det_h", ""), type="number", step="1", style=_inp)
+                    html.Label("Detector width (px)", style=_lbl)
+                    html.Input(v_model=("exp_det_w", ""), type="number", step="1", style=_inp)
+                    html.Label("Beam center height (px)", style=_lbl)
+                    html.Input(v_model=("exp_bc_h", ""), type="number", step="1", style=_inp)
+                    html.Label("Beam center width (px)", style=_lbl)
+                    html.Input(v_model=("exp_bc_w", ""), type="number", step="1", style=_inp)
+                    html.Label("Energy (keV)", style=_lbl)
+                    html.Input(v_model=("exp_energy", ""), type="number", step="1e-3", style=_inp)
+                    html.Label("Wavelength (\u00c5)", style=_lbl)
+                    html.Input(v_model=("exp_wavelength", ""), type="number", step="1e-3", style=_inp)
+
+                    with html.Div(style="display:flex; gap:8px; margin-top:14px;"):
+                        html.Button("\U0001F4C2 Load Data", click=ctrl.load_data, style=_btn)
+                        html.Button("\U0001F4C8 View Intensity", click=ctrl.view_intensity, style=_btn)
+
+                    # Crop
+                    html.Strong("Crop", style="display:block; margin-top:16px;")
+                    html.Label("Crop rows (top / bottom)", style=_lbl)
+                    with html.Div(style="display:flex; gap:8px;"):
+                        html.Input(v_model=("crop_row_min", ""), type="number", placeholder="top", style="flex:1; min-width:0;")
+                        html.Input(v_model=("crop_row_max", ""), type="number", placeholder="bottom", style="flex:1; min-width:0;")
+                    html.Label("Crop cols (left / right)", style=_lbl)
+                    with html.Div(style="display:flex; gap:8px;"):
+                        html.Input(v_model=("crop_col_min", ""), type="number", placeholder="left", style="flex:1; min-width:0;")
+                        html.Input(v_model=("crop_col_max", ""), type="number", placeholder="right", style="flex:1; min-width:0;")
+                    html.Button("\U0001F532 Crop from ROI", click=ctrl.crop_from_roi, style="width:100%; margin-top:12px; padding:10px 8px; cursor:pointer;")
+
+                # ===================== BUILD TAB =====================
+                with html.Div(
+                    style=_bar, click="open_tab = open_tab === 'build' ? '' : 'build'"
                 ):
-                    html.Option("Q-space", value="q")
-                    html.Option("HKL", value="hkl")
-                html.Label("Grid size")
-                html.Input(
-                    v_model=("grid_size", ""),
-                    type="number",
-                    min="16",
-                    step="8",
-                    style="width:100%; margin-bottom:12px;",
-                )
-                # html.Label("Low-memory build")
-                # with html.Div(style="display:flex; align-items:center; margin-bottom:12px;"):
-                #     html.Input(v_model=("stream_build", ""), type="checkbox", style="margin-right:8px;")
-                #     html.Span("Stream frames (avoids large RAM use)")
-                html.Label("Colormap")
-                with html.Select(
-                    v_model=("colormap", ""),
-                    style="width:100%; margin-bottom:12px;",
+                    html.Span("Build")
+                    html.Span("{{ open_tab === 'build' ? '\u25BC' : '\u25B6' }}")
+                with html.Div(v_show="open_tab === 'build'", style=_panel):
+                    html.Label("Space", style=_lbl)
+                    with html.Select(v_model=("space", ""), style=_inp):
+                        html.Option("Q-space", value="q")
+                        html.Option("HKL", value="hkl")
+                    html.Label("Grid size", style=_lbl)
+                    html.Input(v_model=("grid_size", ""), type="number", min="16", step="8", style=_inp)
+                    html.Label("Normalize", style=_lbl)
+                    with html.Select(v_model=("normalize", ""), style=_inp):
+                        html.Option("mean", value="mean")
+                        html.Option("sum", value="sum")
+                    with html.Div(style="display:flex; gap:8px; margin-top:14px;"):
+                        html.Button("\U0001F527 Build RSM", click=ctrl.build_rsm, style=_btn)
+                        html.Button("\U0001F9EE Regrid", click=ctrl.regrid, style=_btn)
+
+                # ===================== VIEW TAB =====================
+                with html.Div(
+                    style=_bar, click="open_tab = open_tab === 'view' ? '' : 'view'"
                 ):
-                    for name in COLORMAP_NAMES:
-                        html.Option(name, value=name)
-                html.Label("Opacity scale")
-                html.Input(
-                    v_model=("opacity_scale", ""),
-                    type="number",
-                    min="0.0",
-                    max="1.0",
-                    step="0.1",
-                    style="width:100%; margin-bottom:12px;",
-                )
-                html.Label("Blend mode")
-                with html.Select(
-                    v_model=("blend_mode", ""),
-                    style="width:100%; margin-bottom:12px;",
+                    html.Span("View")
+                    html.Span("{{ open_tab === 'view' ? '\u25BC' : '\u25B6' }}")
+                with html.Div(v_show="open_tab === 'view'", style=_panel):
+                    with html.Div(style="display:flex; gap:8px;"):
+                        html.Button("\U0001F52D View RSM", click=ctrl.view_rsm, style=_btn)
+                        html.Button("\u21BB Refresh", click=ctrl.refresh_rendering, style=_btn)
+                        html.Button("\u23F9 Stop", click=ctrl.stop_task, style=_btn)
+
+                    with html.Div(style="display:flex; align-items:center; margin-top:14px;"):
+                        html.Input(v_model=("log_view", ""), type="checkbox", style="margin-right:8px;")
+                        html.Span("Log view")
+
+                    html.Label("Colormap", style=_lbl)
+                    with html.Select(v_model=("colormap", ""), style=_inp):
+                        for name in COLORMAP_NAMES:
+                            html.Option(name, value=name)
+                    html.Label("Rendering", style=_lbl)
+                    with html.Select(v_model=("rendering", ""), style=_inp):
+                        html.Option("attenuated_mip", value="attenuated_mip")
+                        html.Option("mip", value="mip")
+                        html.Option("translucent", value="translucent")
+                    html.Label("Contrast low (%)", style=_lbl)
+                    html.Input(v_model=("contrast_lo", ""), type="number", min="0", max="100", step="0.1", style=_inp)
+                    html.Label("Contrast high (%)", style=_lbl)
+                    html.Input(v_model=("contrast_hi", ""), type="number", min="0", max="100", step="0.1", style=_inp)
+
+                    html.Strong("Export", style="display:block; margin-top:16px;")
+                    html.Label("Export path", style=_lbl)
+                    html.Input(v_model=("export_path", ""), placeholder="/path/to/output.vtr", style=_inp)
+                    html.Button("\U0001F4BE Export VTR", click=ctrl.export_vtr, style="width:100%; margin-top:12px; padding:10px 8px; cursor:pointer;")
+
+                # ===================== ANALYSIS TAB =====================
+                with html.Div(
+                    style=_bar, click="open_tab = open_tab === 'analysis' ? '' : 'analysis'"
                 ):
-                    html.Option("Composite", value="0")
-                    html.Option("Maximum intensity", value="1")
-                html.Label("Crop enabled")
-                with html.Div(style="display:flex; align-items:center; margin-bottom:12px;"):
-                    html.Input(v_model=("crop_enabled", ""), type="checkbox", style="margin-right:8px;")
-                    html.Span("Enable crop window")
-                html.Label("Crop rows")
-                with html.Div(style="display:flex; gap:8px; margin-bottom:12px;"):
-                    html.Input(
-                        v_model=("crop_row_min", ""),
-                        type="number",
-                        placeholder="top",
-                        style="flex:1; min-width:0;",
-                    )
-                    html.Input(
-                        v_model=("crop_row_max", ""),
-                        type="number",
-                        placeholder="bottom",
-                        style="flex:1; min-width:0;",
-                    )
-                html.Label("Crop cols")
-                with html.Div(style="display:flex; gap:8px; margin-bottom:12px;"):
-                    html.Input(
-                        v_model=("crop_col_min", ""),
-                        type="number",
-                        placeholder="left",
-                        style="flex:1; min-width:0;",
-                    )
-                    html.Input(
-                        v_model=("crop_col_max", ""),
-                        type="number",
-                        placeholder="right",
-                        style="flex:1; min-width:0;",
-                    )
-                with html.Div():
-                    html.Button("Load and build RSM", click=ctrl.build_rsm, style="width:100%; margin-bottom:12px; padding:12px 8px;")
-                    html.Button("Export VTR", click=ctrl.export_vtr, style="width:100%; margin-bottom:12px; padding:12px 8px;")
-                html.Label("Export path")
-                html.Input(
-                    v_model=("export_path", ""),
-                    placeholder="/path/to/output.vtr",
-                    style="width:100%; margin-top:12px;",
-                )
+                    html.Span("Analysis")
+                    html.Span("{{ open_tab === 'analysis' ? '\u25BC' : '\u25B6' }}")
+                with html.Div(v_show="open_tab === 'analysis'", style=_panel):
+                    # --- Orthogonal slicing ---
+                    html.Strong("Orthogonal Slicing", style="display:block;")
+                    for ax, lbl in (("x", "X"), ("y", "Y"), ("z", "Z")):
+                        with html.Div(style="display:flex; align-items:center; gap:8px; margin-top:8px;"):
+                            html.Input(v_model=(f"slice_{ax}_show", ""), type="checkbox", change=ctrl.update_slices)
+                            html.Span(f"{lbl}", style="width:14px;")
+                            html.Input(
+                                v_model=(f"slice_{ax}_pos", ""), type="range", min="0", max="100", step="1",
+                                change=ctrl.update_slices, style="flex:1;",
+                            )
+                            html.Span("{{ " + f"slice_{ax}_pos" + " }}%", style="width:38px; font-size:0.8rem;")
+                    html.Label("Slice opacity", style=_lbl)
+                    html.Input(v_model=("slice_opacity", ""), type="number", min="0", max="1", step="0.1", change=ctrl.update_slices, style=_inp)
+                    html.Label("Slice colormap", style=_lbl)
+                    with html.Select(v_model=("slice_cmap", ""), change=ctrl.update_slices, style=_inp):
+                        for name in ["turbo", "viridis", "inferno", "plasma", "gray", "hsv"]:
+                            html.Option(name, value=name)
+                    with html.Div(style="display:flex; align-items:center; margin-top:10px;"):
+                        html.Input(v_model=("slice_show_border", ""), type="checkbox", change=ctrl.update_slices, style="margin-right:8px;")
+                        html.Span("Show border")
+
+                    # --- Cylindrical slicing ---
+                    html.Strong("Cylindrical Slicing (Q space)", style="display:block; margin-top:18px;")
+                    with html.Div(style="display:flex; align-items:center; margin-top:8px;"):
+                        html.Input(v_model=("cyl_show", ""), type="checkbox", change=ctrl.update_slices, style="margin-right:8px;")
+                        html.Span("Show cylinder")
+                    html.Label("Cylinder radius (\u00c5\u207b\u00b9)", style=_lbl)
+                    html.Input(v_model=("cyl_radius", ""), type="number", min="0", step="0.01", change=ctrl.update_slices, style=_inp)
+                    html.Label("Angular samples", style=_lbl)
+                    html.Input(v_model=("cyl_samples", ""), type="number", min="16", max="360", step="8", change=ctrl.update_slices, style=_inp)
+                    html.Label("Opacity", style=_lbl)
+                    html.Input(v_model=("cyl_opacity", ""), type="number", min="0", max="1", step="0.1", change=ctrl.update_slices, style=_inp)
+                    html.Label("Colormap", style=_lbl)
+                    with html.Select(v_model=("cyl_cmap", ""), change=ctrl.update_slices, style=_inp):
+                        for name in ["turbo", "viridis", "inferno", "plasma", "gray", "hsv"]:
+                            html.Option(name, value=name)
+
+                    # --- Spherical slicing ---
+                    html.Strong("Spherical Slicing (Q space)", style="display:block; margin-top:18px;")
+                    with html.Div(style="display:flex; align-items:center; margin-top:8px;"):
+                        html.Input(v_model=("sph_show", ""), type="checkbox", change=ctrl.update_slices, style="margin-right:8px;")
+                        html.Span("Show sphere")
+                    html.Label("Sphere radius (\u00c5\u207b\u00b9)", style=_lbl)
+                    html.Input(v_model=("sph_radius", ""), type="number", min="0", step="0.01", change=ctrl.update_slices, style=_inp)
+                    html.Label("Angular samples", style=_lbl)
+                    html.Input(v_model=("sph_samples", ""), type="number", min="16", max="180", step="8", change=ctrl.update_slices, style=_inp)
+                    html.Label("Opacity", style=_lbl)
+                    html.Input(v_model=("sph_opacity", ""), type="number", min="0", max="1", step="0.1", change=ctrl.update_slices, style=_inp)
+                    html.Label("Colormap", style=_lbl)
+                    with html.Select(v_model=("sph_cmap", ""), change=ctrl.update_slices, style=_inp):
+                        for name in ["turbo", "viridis", "inferno", "plasma", "gray", "hsv"]:
+                            html.Option(name, value=name)
+
+                # ---- Status (always visible, below the accordion) ----------
                 html.Hr(style="border-color:#e0e0e0; margin:16px 0;")
                 html.Strong("Status")
                 # Scrollable status history. `flex-direction:column-reverse`
