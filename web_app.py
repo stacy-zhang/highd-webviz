@@ -470,16 +470,22 @@ def create_server():
             remote_view.update()
 
     def _set_volume_data(volume: np.ndarray, axes: Tuple[np.ndarray, np.ndarray, np.ndarray]):
-        nonlocal current_volume, current_axes, render_range
+        nonlocal current_volume, current_axes, render_range, current_image
         current_volume = np.asarray(volume, dtype=np.float32)
         current_axes = axes
 
         # Log-compress for display so the high-dynamic-range RSM is visible,
-        # and derive the transfer-function range from robust percentiles of the
-        # log-scaled data (mirrors the napari viewer). The raw current_volume is
-        # kept untouched for VTR export.
-        display_volume = _log1p_clip(current_volume)
-        render_range = _robust_percentiles(display_volume, (1.0, 99.8))
+        # and derive the transfer-function range from user-inputted contrast percentiles.
+        # The raw current_volume is kept untouched for VTR export.
+        if bool(getattr(state, "log_view", True)):
+            display_volume = _log1p_clip(current_volume)
+        else:
+            display_volume = np.maximum(current_volume, 0.0)
+        lo = _float(getattr(state, "contrast_lo", 1.0), 1.0)
+        hi = _float(getattr(state, "contrast_hi", 99.8), 99.8)
+        if not (0.0 <= lo < hi <= 100.0):
+            lo, hi = 1.0, 99.8
+        render_range = _robust_percentiles(display_volume, (lo, hi))
 
         image = vtkImageData()
         nx, ny, nz = display_volume.shape
