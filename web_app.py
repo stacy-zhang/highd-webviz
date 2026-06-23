@@ -514,16 +514,237 @@ def create_server():
         image.GetPointData().SetScalars(vtk_array)
         volume_mapper.SetInputData(image)
         volume_actor.VisibilityOn()
+        current_image = image
         renderer.ResetCamera()
         _update_rendering()
         return current_volume, current_axes
+        # ---------------------------------------------------------------------
+    # Analysis: orthogonal / cylindrical / spherical slicing helpers
+    # ---------------------------------------------------------------------
+    def _axis_bounds(image, axis_index):
+        origin = image.GetOrigin()
+        spacing = image.GetSpacing()
+        dims = image.GetDimensions()
+        lo = origin[axis_index]
+        hi = origin[axis_index] + spacing[axis_index] * max(0, dims[axis_index] - 1)
+        return float(lo), float(hi)
 
-    @ctrl.set("build_rsm")
-    async def build_rsm(**kwargs):
-        nonlocal current_builder
-        _set_status("Loading data...")
+    def _update_ortho_slice(axis):
+        if current_image is None or render_range is None:
+            slice_actors[axis].VisibilityOff()
+            return
+        axis_index = {"x": 0, "y": 1, "z": 2}[axis]
+        show = bool(getattr(state, f"slice_{axis}_show", False))
+        if not show:
+            slice_actors[axis].VisibilityOff()
+            return
+        pos_pct = _float(getattr(state, f"slice_{axis}_pos", 50), 50.0)
+        lo, hi = _axis_bounds(current_image, axis_index)
+        coord = lo + (hi - lo) * max(0.0, min(pos_pct, 100.0)) / 100.0
+
+        normal = [0.0, 0.0, 0.0]
+        normal[axis_index] = 1.0
+        origin = [0.0, 0.0, 0.0]
+        center = current_image.GetCenter()
+        origin[0], origin[1], origin[2] = center
+        origin[axis_index] = coord
+
+        mapper = slice_mappers[axis]
+        mapper.SetInputData(current_image)
+        plane = mapper.GetSlicePlane()
+        plane.SetOrigin(*origin)
+        plane.SetNormal(*normal)
+
+        lut = _make_lookup_table(_ensure_path(state.slice_cmap), render_range)
+        prop = slice_actors[axis].GetProperty()
+        prop.SetLookupTable(lut)
+        prop.UseLookupTableScalarRangeOn()
+        prop.SetOpacity(_float(state.slice_opacity, 0.8))
+        slice_actors[axis].VisibilityOn()
+
+    def _probe_surface(actor, source_output, colormap, opacity, show):
+        if not show or current_image is None or render_range is None:
+            actor.VisibilityOff()
+            return
+        probe = vtkProbeFilter()
+        probe.SetInputData(source_output)
+        probe.SetSourceData(current_image)
+        probe.Update()
+        lut = _make_lookup_table(colormap, render_range)
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(probe.GetOutput())
+        mapper.SetLookupTable(lut)
+        mapper.SetScalarRange(render_range[0], render_range[1])
+        mapper.SetScalarModeToUsePointData()
+        mapper.SelectColorArray("intensity")
+        mapper.SetColorModeToMapScalars()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetOpacity(_float(opacity, 0.7))
+        actor.VisibilityOn()
+
+    def _update_cylinder():
+        if current_image is None:
+            cyl_actor.VisibilityOff()
+            return
+        show = bool(state.cyl_show)
+        if not show:
+            cyl_actor.VisibilityOff()
+            return
+        center = current_image.GetCenter()
+        _, zhi = _axis_bounds(current_image, 2)
+        zlo, _ = _axis_bounds(current_image, 2)
+        height = max(1e-6, zhi - zlo)
+        radius = _float(state.cyl_radius, 1.0)
+        samples = max(8, int(_float(state.cyl_samples, 64)))
+        src = vtkCylinderSource()
+        src.SetRadius(radius)
+        src.SetHeight(height)
+        src.SetResolution(samples)
+        src.CappingOff()
+        src.Update()
+        # vtkCylinderSource is aligned to Y; rotate so its axis lies along Z and
+        # translate to the volume center.
+        tf = vtkTransform()
+        tf.Translate(center[0], center[1], center[2])
+        tf.RotateX(90.0)
+        tpd = vtkTransformPolyDataFilter()
+        tpd.SetTransform(tf)
+        tpd.SetInputData(src.GetOutput())
+        tpd.Update()
+        _probe_surface(
+            cyl_actor, tpd.GetOutput(), _ensure_path(state.cyl_cmap),
+            _float(state.cyl_opacity, 0.7), show,
+        )
+
+    def _update_sphere():
+        if current_image is None:
+            sph_actor.VisibilityOff()
+            return
+        show = bool(state.sph_show)
+        if not show:
+            sph_actor.VisibilityOff()
+            return
+        center = current_image.GetCenter()
+        radius = _float(state.sph_radius, 1.0)
+        samples = max(8, int(_float(state.sph_samples, 64)))
+        src = vtkSphereSource()
+        src.SetCenter(center[0], center[1], center[2])
+        src.SetRadius(radius)
+        src.SetThetaResolution(samples)
+        src.SetPhiResolution(samples)
+        src.Update()
+        _probe_surface(
+            sph_actor, src.GetOutput(), _ensure_path(state.sph_cmap),
+            _float(state.sph_opacity, 0.7), show,
+        )
+
+    def _update_all_slices():
+        try:
+            for axis in ("x", "y", "z"):
+                _update_ortho_slice(axis)
+            _update_cylinder()
+            _update_sphere()
+        except Exception as exc:  # never let slicing break the main render
+            _set_status(f"Slice update skipped: {exc}")
+
+    @ctrl.set("update_slices")
+    def update_slices(**kwargs):
+        _update_all_slices()
+        render_window.Render()
+        if remote_view is not None:
+            remote_view.update()
+
+    # ---------------------------------------------------------------------
+    # Data loading helpers
+    # ---------------------------------------------------------------------
+    def _load_experiment(loader_mode):
         setup_path = Path(_ensure_path(state.setup_path)).expanduser()
         tiff_dir = Path(_ensure_path(state.tiff_dir)).expanduser()
+        if loader_mode == "ISR":
+            spec_path = Path(_ensure_path(state.spec_path)).expanduser()
+            loader = RSMDataLoader_ISR(
+                str(spec_path),
+                str(setup_path),
+                str(tiff_dir),
+                use_dask=False,
+            )
+            setup, ub, df = loader.load()
+        else:
+            loader = RSMDataloader_CMS(
+                str(setup_path),
+                str(tiff_dir),
+                angle_step=_float(state.cms_angle_step, 1.0),
+            )
+            setup, ub, df = loader.load()
+        frames = None
+        if df is not None and "intensity" in getattr(df, "columns", []):
+            frames = list(df["intensity"])
+        return setup, ub, df, frames
+
+    def _populate_setup_fields(setup, frames):
+        """Reflect a loaded ExperimentSetup into the Data-tab fields."""
+        if setup is not None:
+            state.exp_distance = float(getattr(setup, "distance", 0.0) or 0.0)
+            state.exp_pitch = float(getattr(setup, "pitch", 0.0) or 0.0)
+            state.exp_det_h = int(getattr(setup, "ypixels", 0) or 0)
+            state.exp_det_w = int(getattr(setup, "xpixels", 0) or 0)
+            state.exp_bc_h = int(getattr(setup, "ycenter", 0) or 0)
+            state.exp_bc_w = int(getattr(setup, "xcenter", 0) or 0)
+            state.exp_energy = float(getattr(setup, "energy", 0.0) or 0.0)
+            state.exp_wavelength = float(getattr(setup, "wavelength", 0.0) or 0.0)
+        # Detector dimensions from the actual frames take precedence.
+        if frames:
+            first = frames[0]
+            if hasattr(first, "shape") and len(first.shape) >= 2:
+                h, w = int(first.shape[-2]), int(first.shape[-1])
+                state.exp_det_h = h
+                state.exp_det_w = w
+
+    def _apply_setup_overrides(setup):
+        """Push user-edited Data-tab values onto the setup before building."""
+        if setup is None:
+            return
+        try:
+            setup.distance = float(state.exp_distance) or setup.distance
+            setup.pitch = float(state.exp_pitch) or setup.pitch
+            setup.ypixels = int(state.exp_det_h) or setup.ypixels
+            setup.xpixels = int(state.exp_det_w) or setup.xpixels
+            setup.ycenter = int(state.exp_bc_h)
+            setup.xcenter = int(state.exp_bc_w)
+            if float(state.exp_energy) > 0:
+                setup.energy = float(state.exp_energy)
+            if float(state.exp_wavelength) > 0:
+                setup.wavelength = float(state.exp_wavelength)
+        except (TypeError, ValueError) as exc:
+            _set_status(f"Setup override skipped: {exc}")
+
+    def _compute_builder(setup, ub, df):
+        builder = RSMBuilder(setup, ub, df, ub_includes_2pi=True)
+        builder.compute_full(verbose=False)
+        return builder
+
+    def _regrid_volume(builder, grid_size):
+        return builder.regrid_xu(
+            space=_ensure_path(state.space) or "q",
+            grid_shape=(grid_size, grid_size, grid_size),
+            normalize=_ensure_path(state.normalize) or "mean",
+        )
+
+    def _track(coro):
+        """Run a coroutine as a cancellable task (for the Stop button)."""
+        nonlocal current_task
+        loop = asyncio.get_event_loop()
+        current_task = loop.create_task(coro)
+        return current_task
+
+    # ---------------------------------------------------------------------
+    # Pipeline actions
+    # ---------------------------------------------------------------------
+    async def _do_load_data():
+        nonlocal current_setup, current_ub, current_df, current_frames
+        nonlocal current_builder, regrid_volume, regrid_axes
+        tiff_dir = Path(_ensure_path(state.tiff_dir)).expanduser()
+        setup_path = Path(_ensure_path(state.setup_path)).expanduser()
         loader_mode = _ensure_path(state.loader_mode).upper() or "CMS"
 
         if not setup_path.is_file():
