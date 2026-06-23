@@ -374,6 +374,30 @@ def create_server():
     renderer.AddVolume(volume_actor)
     renderer.ResetCamera()
 
+    # --- Analysis: orthogonal slice actors (one per axis) ------------------
+    # Each axis gets a vtkImageSlice backed by a reslice mapper. They are
+    # hidden until the user enables them in the Analysis tab.
+    slice_actors = {}
+    slice_mappers = {}
+    for axis in ("x", "y", "z"):
+        mapper = vtkImageResliceMapper()
+        mapper.SliceFacesCameraOff()
+        mapper.SliceAtFocalPointOff()
+        actor = vtkImageSlice()
+        actor.SetMapper(mapper)
+        actor.VisibilityOff()
+        renderer.AddViewProp(actor)
+        slice_mappers[axis] = mapper
+        slice_actors[axis] = actor
+
+    # --- Analysis: cylindrical / spherical probe actors --------------------
+    cyl_actor = vtkActor()
+    cyl_actor.VisibilityOff()
+    renderer.AddActor(cyl_actor)
+    sph_actor = vtkActor()
+    sph_actor.VisibilityOff()
+    renderer.AddActor(sph_actor)
+
     current_volume = None
     current_axes = None
     current_builder = None
