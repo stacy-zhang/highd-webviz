@@ -517,6 +517,7 @@ def create_server():
         current_image = image
         renderer.ResetCamera()
         _update_rendering()
+        _update_all_slices()
         return current_volume, current_axes
         # ---------------------------------------------------------------------
     # Analysis: orthogonal / cylindrical / spherical slicing helpers
