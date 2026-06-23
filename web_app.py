@@ -272,6 +272,33 @@ def create_server():
     state.setdefault("contrast_hi", 99.8)
     state.setdefault("export_path", str(Path.cwd() / "rsm_output.vtr"))
 
+    # Analysis tab
+    ## orthogonal slicing (positions are 0-100)
+    state.setdefault("slice_x_show", False)
+    state.setdefault("slice_y_show", False)
+    state.setdefault("slice_z_show", False)
+    state.setdefault("slice_x_pos", 50)
+    state.setdefault("slice_y_pos", 50)
+    state.setdefault("slice_z_pos", 50)
+    state.setdefault("slice_opacity", 0.8)
+    state.setdefault("slice_cmap", "turbo")
+    state.setdefault("slice_show_border", True)
+    
+    ## cylindrical slicing (Q space only)
+    state.setdefault("cyl_show", False)
+    state.setdefault("cyl_radius", 1.0)
+    state.setdefault("cyl_samples", 64)
+    state.setdefault("cyl_opacity", 0.7)
+    state.setdefault("cyl_cmap", "plasma")
+
+    ## spherical slicing (Q space only)
+    state.setdefault("sph_show", False)
+    state.setdefault("sph_radius", 1.0)
+    state.setdefault("sph_samples", 64)
+    state.setdefault("sph_opacity", 0.7)
+    state.setdefault("sph_cmap", "viridis")
+
+
     state.setdefault("blend_mode", 0)
     state.setdefault("shade", True)
     state.setdefault("opacity_scale", 1.0)
@@ -296,6 +323,10 @@ def create_server():
 
     # Sidebar visibility
     state.setdefault("sidebar_open", True)
+
+    # Which tab is expanded ("" = all collapsed; one of data/build/view/analysis)
+    state.setdefault("open_tab", "")
+
 
     renderer = vtkRenderer()
     renderer.SetBackground(0.10, 0.10, 0.12)
