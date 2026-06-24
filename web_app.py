@@ -1030,6 +1030,30 @@ def create_server():
     def _fb_cancel():
         state.fb_show = False
 
+    # Keep energy (keV) and wavelength (Å) in sync: λ[Å] = 12.398 / E[keV].
+    # review_widget.py line 1215
+    _ew_sync = {"busy": False}
+
+    @state.change("exp_energy")
+    def _on_energy_change(exp_energy=None, **kwargs):
+        if _ew_sync["busy"]:
+            return
+        energy = _float(exp_energy, 0.0)
+        if energy > 0:
+            _ew_sync["busy"] = True
+            state.exp_wavelength = 12.398419843320026 / energy
+            _ew_sync["busy"] = False
+
+    @state.change("exp_wavelength")
+    def _on_wavelength_change(exp_wavelength=None, **kwargs):
+        if _ew_sync["busy"]:
+            return
+        wavelength = _float(exp_wavelength, 0.0)
+        if wavelength > 0:
+            _ew_sync["busy"] = True
+            state.exp_energy = 12.398419843320026 / wavelength
+            _ew_sync["busy"] = False
+
     with DivLayout(server) as layout:
         # NOTE: VtkRemoteView is instantiated later, inside the right-hand 3D
         # view panel (which has a defined non-zero size). Do NOT create a
