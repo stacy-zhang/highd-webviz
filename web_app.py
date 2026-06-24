@@ -1054,6 +1054,13 @@ def create_server():
             state.exp_energy = 12.398419843320026 / wavelength
             _ew_sync["busy"] = False
 
+    # Clamp the CMS angle step to the valid [0, 360] range. Corrects a typed out-of-range value.
+    @state.change("cms_angle_step")
+    def _on_cms_angle_step_change(cms_angle_step=None, **kwargs):
+        clamped = max(0.0, min(360.0, _float(cms_angle_step, 0.0)))
+        if clamped != _float(cms_angle_step, None):
+            state.cms_angle_step = clamped
+
     with DivLayout(server) as layout:
         # NOTE: VtkRemoteView is instantiated later, inside the right-hand 3D
         # view panel (which has a defined non-zero size). Do NOT create a
@@ -1157,7 +1164,7 @@ def create_server():
                         html.Label("Angle step (\u00b0)", style=_lbl)
                         html.Input(
                             v_model=("cms_angle_step", ""),
-                            type="number", step="0.01",
+                            type="number", step="0.01", min="0", max="360",
                             style=_inp,
                         )
 
