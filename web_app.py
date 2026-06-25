@@ -249,6 +249,11 @@ def create_server():
     state.setdefault("tiff_dir", "")
     state.setdefault("spec_path", "")
     state.setdefault("cms_angle_step", 0.50) # range from 0 to 360, default 0.50 (every half-degree)
+    # Frame range to load (0-based, inclusive start / exclusive end). end <= 0
+    # means "load through the last frame" so the user can cap how many of the
+    # (e.g. 962) frames are materialized at once.
+    state.setdefault("frame_start", 0)
+    state.setdefault("frame_end", 0)
     state.setdefault("crop_enabled", False)
     state.setdefault("crop_row_min", 0)
     state.setdefault("crop_row_max", 0)
@@ -314,6 +319,11 @@ def create_server():
     state.setdefault("status_log", ["Ready"])
     state.setdefault("scalar_range", "—")
     state.setdefault("volume_dims", "—")
+    # Intensity frame viewer (View Intensity): the bottom slider scrubs through
+    # frames [0, intensity_frame_max] of the currently loaded range.
+    state.setdefault("intensity_slider_show", False)
+    state.setdefault("intensity_frame_index", 0)
+    state.setdefault("intensity_frame_max", 0)
     state.setdefault("ambient", 0.2)
     state.setdefault("diffuse", 0.7)
     state.setdefault("specular", 0.3)
@@ -395,6 +405,16 @@ def create_server():
     sph_actor.VisibilityOff()
     renderer.AddActor(sph_actor)
 
+    # --- Intensity frame viewer: a single 2D image slice scrubbed by the
+    # bottom slider (View Intensity). Hidden until the user enables it.
+    intensity_mapper = vtkImageResliceMapper()
+    intensity_mapper.SliceFacesCameraOff()
+    intensity_mapper.SliceAtFocalPointOff()
+    intensity_actor = vtkImageSlice()
+    intensity_actor.SetMapper(intensity_mapper)
+    intensity_actor.VisibilityOff()
+    renderer.AddViewProp(intensity_actor)
+
     current_volume = None
     current_axes = None
     current_builder = None
@@ -468,6 +488,9 @@ def create_server():
 
     def _set_volume_data(volume: np.ndarray, axes: Tuple[np.ndarray, np.ndarray, np.ndarray]):
         nonlocal current_volume, current_axes, render_range, current_image
+        # Switching to a volume view supersedes the 2D intensity-frame viewer.
+        intensity_actor.VisibilityOff()
+        state.intensity_slider_show = False
         current_volume = np.asarray(volume, dtype=np.float32)
         current_axes = axes
 
@@ -676,6 +699,21 @@ def create_server():
             setup, ub, df = loader.load()
         frames = None
         if df is not None and "intensity" in getattr(df, "columns", []):
+            # Restrict to the user-requested frame range so only that subset is
+            # retained in memory and exposed to the intensity slider. The end
+            # value is inclusive; end <= 0 (or beyond the data) is treated as
+            # "through the last frame".
+            n_total = len(df)
+            fs = max(0, int(_float(getattr(state, "frame_start", 0), 0)))
+            fe_inclusive = int(_float(getattr(state, "frame_end", 0), 0))
+            if fe_inclusive <= 0 or fe_inclusive >= n_total:
+                fe = n_total
+            else:
+                fe = fe_inclusive + 1  # make the inclusive bound exclusive
+            if fs >= fe:
+                fs = 0
+            if fs > 0 or fe < n_total:
+                df = df.iloc[fs:fe].reset_index(drop=True)
             frames = list(df["intensity"])
         return setup, ub, df, frames
 
@@ -768,6 +806,7 @@ def create_server():
             current_builder = None
             regrid_volume = None
             regrid_axes = None
+            state.intensity_slider_show = False
             _populate_setup_fields(setup, frames)
             n = len(frames) if frames else 0
             _set_status(f"Data loaded ({n} frame(s)). Ready to build.")
@@ -845,24 +884,88 @@ def create_server():
         if not current_frames:
             _set_status("No intensity frames. Load data first.")
             return
+        n = len(current_frames)
+        # Frame-by-frame mode: hide the volume / analysis props and show a
+        # single 2D image that the bottom slider scrubs through.
+        volume_actor.VisibilityOff()
+        for actor in slice_actors.values():
+            actor.VisibilityOff()
+        cyl_actor.VisibilityOff()
+        sph_actor.VisibilityOff()
+        state.intensity_frame_max = n - 1
+        state.intensity_slider_show = True
+        if int(_float(state.intensity_frame_index, 0)) != 0:
+            # Reset to the first frame; the change handler will render it.
+            state.intensity_frame_index = 0
         try:
-            stack = np.asarray(
-                [np.asarray(f, dtype=np.float32) for f in current_frames],
-                dtype=np.float32,
-            )
+            _show_intensity_frame(0, reset_camera=True)
         except Exception as exc:
             _set_status(f"Intensity view error: {exc}")
             return
-        nz, ny, nx = stack.shape
-        axes = (
-            np.arange(nz, dtype=float),
-            np.arange(ny, dtype=float),
-            np.arange(nx, dtype=float),
+        _set_status(f"Viewing intensity frames (0–{n - 1}). Use the slider to scrub.")
+
+    def _show_intensity_frame(index, reset_camera=False):
+        """Display a single raw intensity frame as a 2D image slice."""
+        if not current_frames:
+            return
+        n = len(current_frames)
+        index = max(0, min(int(index), n - 1))
+        frame = np.asarray(current_frames[index], dtype=np.float32)
+        if frame.ndim != 2:
+            frame = np.squeeze(frame)
+        if frame.ndim != 2:
+            _set_status(f"Frame {index} is not 2D; cannot display.")
+            return
+
+        # Mirror the volume display path: log-compress and frame the colormap
+        # over robust contrast percentiles.
+        if bool(getattr(state, "log_view", True)):
+            disp = _log1p_clip(frame)
+        else:
+            disp = np.maximum(frame, 0.0)
+        lo = _float(getattr(state, "contrast_lo", 1.0), 1.0)
+        hi = _float(getattr(state, "contrast_hi", 99.8), 99.8)
+        if not (0.0 <= lo < hi <= 100.0):
+            lo, hi = 1.0, 99.8
+        frange = _robust_percentiles(disp, (lo, hi))
+
+        ny, nx = disp.shape
+        image = vtkImageData()
+        image.SetDimensions(nx, ny, 1)
+        image.SetSpacing(1.0, 1.0, 1.0)
+        image.SetOrigin(0.0, 0.0, 0.0)
+        vtk_array = numpy_support.numpy_to_vtk(
+            np.ascontiguousarray(disp, dtype=np.float32).ravel(order="C"),
+            deep=True,
+            array_type=numpy_support.get_vtk_array_type(np.float32),
         )
-        # _set_volume_data expects (nx, ny, nz) ordering of the array.
-        _set_status("Displaying raw intensity frames...")
-        _set_volume_data(np.transpose(stack, (2, 1, 0)), axes)
-        _set_status(f"Intensity stack displayed ({nz} frame(s)).")
+        vtk_array.SetName("intensity")
+        image.GetPointData().SetScalars(vtk_array)
+
+        intensity_mapper.SetInputData(image)
+        plane = intensity_mapper.GetSlicePlane()
+        plane.SetOrigin(0.0, 0.0, 0.0)
+        plane.SetNormal(0.0, 0.0, 1.0)
+
+        lut = _make_lookup_table(_ensure_path(state.colormap), frange)
+        prop = intensity_actor.GetProperty()
+        prop.SetLookupTable(lut)
+        prop.UseLookupTableScalarRangeOn()
+        intensity_actor.VisibilityOn()
+
+        if reset_camera:
+            renderer.ResetCamera()
+        render_window.Render()
+        if remote_view is not None:
+            remote_view.update()
+
+    @state.change("intensity_frame_index")
+    def _on_intensity_frame_change(intensity_frame_index=None, **kwargs):
+        if not bool(getattr(state, "intensity_slider_show", False)):
+            return
+        if not current_frames:
+            return
+        _show_intensity_frame(int(_float(intensity_frame_index, 0)))
 
     @ctrl.set("crop_from_roi")
     def crop_from_roi(**kwargs):
@@ -1148,6 +1251,20 @@ def create_server():
                         click=(_fb_open, "['tiff_dir', 'dir']"),
                         style=_inp + " cursor:pointer;",
                     )
+
+                    html.Label("Frame range (start / end, end 0 = all)", style=_lbl)
+                    with html.Div(style="display:flex; gap:8px;"):
+                        html.Input(
+                            v_model=("frame_start", 0),
+                            type="number", min="0", step="1", placeholder="start",
+                            style="flex:1; min-width:0;",
+                        )
+                        html.Input(
+                            v_model=("frame_end", 0),
+                            type="number", min="0", step="1", placeholder="end",
+                            style="flex:1; min-width:0;",
+                        )
+
                     with html.Div(v_show="loader_mode === 'ISR'"):
                         html.Label("SPEC file (ISR only)", style=_lbl)
                         html.Input(
@@ -1392,7 +1509,34 @@ def create_server():
                 # render window to the browser. This reassigns the `remote_view`
                 # closure variable that _update_rendering()/_set_volume_data()
                 # read, so live renders now have a surface to push to.
-                remote_view = VtkRemoteView(render_window, interactive_ratio=1)
+                with html.Div(style="flex:1; min-height:0; position:relative;"):
+                    remote_view = VtkRemoteView(render_window, interactive_ratio=1)
+                # Frame slider: visible after "View Intensity" so the user can
+                # scrub through the loaded frame range one frame at a time.
+                with html.Div(
+                    v_show="intensity_slider_show",
+                    style=(
+                        "flex:0 0 auto; display:flex; align-items:center; gap:12px; "
+                        "padding:10px 16px; background:#16161a; color:#dddddd; "
+                        "border-top:1px solid #2a2a2e; font-family:sans-serif;"
+                    ),
+                ):
+                    html.Span("Frame", style="font-size:0.85rem;")
+                    html.Input(
+                        type="range",
+                        v_model=("intensity_frame_index", 0),
+                        min=0,
+                        max=("intensity_frame_max", 0),
+                        step=1,
+                        style="flex:1; min-width:0;",
+                    )
+                    html.Span(
+                        "{{ intensity_frame_index }} / {{ intensity_frame_max }}",
+                        style=(
+                            "min-width:80px; text-align:right; font-size:0.85rem; "
+                            "font-variant-numeric:tabular-nums;"
+                        ),
+                    )
 
         # File browser modal dialog
         with html.Div(  
