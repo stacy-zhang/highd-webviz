@@ -1078,6 +1078,31 @@ def create_server():
         loop = asyncio.get_event_loop()
         play_task = loop.create_task(_play_loop())
 
+    def _step_intensity_frame(delta):
+        """Step one frame (delta = +1 / -1), wrapping at the range ends."""
+        nonlocal play_task
+        if not current_frames or not bool(getattr(state, "intensity_slider_show", False)):
+            return
+        # A manual step stops playback so the two don't fight over the index.
+        if bool(getattr(state, "intensity_playing", False)):
+            state.intensity_playing = False
+            if play_task is not None:
+                play_task.cancel()
+                play_task = None
+        frame_max = int(_float(getattr(state, "intensity_frame_max", 0), 0))
+        if frame_max <= 0:
+            return
+        cur = int(_float(getattr(state, "intensity_frame_index", 0), 0))
+        state.intensity_frame_index = (cur + delta) % (frame_max + 1)
+
+    @ctrl.set("prev_frame")
+    def prev_frame(**kwargs):
+        _step_intensity_frame(-1)
+
+    @ctrl.set("next_frame")
+    def next_frame(**kwargs):
+        _step_intensity_frame(1)
+
     @ctrl.set("crop_from_roi")
     def crop_from_roi(**kwargs):
         nonlocal current_df, current_frames, current_builder, regrid_volume, regrid_axes
@@ -1654,19 +1679,31 @@ def create_server():
                         "border-top:1px solid #2a2a2e; font-family:sans-serif;"
                     ),
                 ):
+                    _pbtn = (
+                        "flex:0 0 auto; width:32px; height:28px; padding:0; "
+                        "display:flex; align-items:center; justify-content:center; "
+                        "font-size:1rem; line-height:1; cursor:pointer; "
+                        "background:#2a2a2e; color:#dddddd; "
+                        "border:1px solid #44444a; border-radius:4px;"
+                    )
+                    html.Button(
+                        "\u23EE",
+                        click=ctrl.prev_frame,
+                        title="Previous frame",
+                        style=_pbtn,
+                    )
                     html.Button(
                         "{{ intensity_playing ? '\u23F9' : '\u25B6' }}",
                         click=ctrl.toggle_play,
                         title="Play / Stop (10 fps, loops)",
-                        style=(
-                            "flex:0 0 auto; width:32px; height:28px; padding:0; "
-                            "display:flex; align-items:center; justify-content:center; "
-                            "font-size:1rem; line-height:1; cursor:pointer; "
-                            "background:#2a2a2e; color:#dddddd; "
-                            "border:1px solid #44444a; border-radius:4px;"
-                        ),
+                        style=_pbtn,
                     )
-                    html.Span("Frame", style="font-size:0.85rem;")
+                    html.Button(
+                        "\u23ED",
+                        click=ctrl.next_frame,
+                        title="Next frame",
+                        style=_pbtn,
+                    )
                     html.Input(
                         type="range",
                         classes="frame-slider",
