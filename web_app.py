@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 import importlib
 import sys
 import types
+import re
 
 import numpy as np
 import vtkmodules.vtkRenderingOpenGL2  # noqa: F401
@@ -222,6 +223,34 @@ def _crop_dataframe_intensity(df, crop_window):
     df["intensity"] = [frame[r0:r1, c0:c1] for frame in df["intensity"]]
     return df
 
+
+# Default number of frames to pre-select when a TIFF directory is chosen. The
+# scan-range inputs are seeded so the first DEFAULT_FRAME_COUNT frames load.
+DEFAULT_FRAME_COUNT = 362
+
+
+def _scan_numbers_in_dir(tiff_dir: Optional[str]) -> list:
+    """Return the scan numbers parsed from TIFF filenames in ``tiff_dir``.
+
+    Mirrors ``RSMDataloader_CMS``'s filename parsing (the original napari
+    behavior) so the Data-tab scan-range inputs reference the real scan ids
+    embedded in the file names rather than positional frame indices. The list
+    is sorted ascending, matching the order the CMS loader presents frames.
+    """
+    directory = Path(_ensure_path(tiff_dir)).expanduser()
+    if not directory.is_dir():
+        return []
+    pattern = re.compile(RSMDataloader_CMS.SCAN_REGEX)
+    scans = []
+    for path in sorted(
+        list(directory.glob("*.tif")) + list(directory.glob("*.tiff"))
+    ):
+        match = pattern.search(path.name)
+        if match:
+            scans.append(int(match.group(1)))
+    return sorted(scans)
+
+
 # partly copied from resview_widget.py
 DEFAULTS_ENV = "RSM3D_DEFAULTS_YAML"
 # The bundled defaults YAML lives inside the napari_resview package, not next to
@@ -249,9 +278,10 @@ def create_server():
     state.setdefault("tiff_dir", "")
     state.setdefault("spec_path", "")
     state.setdefault("cms_angle_step", 0.50) # range from 0 to 360, default 0.50 (every half-degree)
-    # Frame range to load (0-based, inclusive start / exclusive end). end <= 0
-    # means "load through the last frame" so the user can cap how many of the
-    # (e.g. 962) frames are materialized at once.
+    # Scan-number range to load, parsed from the TIFF filenames. 0 means
+    # "unbounded on this side". When a TIFF directory is selected these are
+    # auto-seeded to cover the first DEFAULT_FRAME_COUNT frames so not all
+    # (e.g. 962) frames are loaded at once.
     state.setdefault("frame_start", 0)
     state.setdefault("frame_end", 0)
     state.setdefault("crop_enabled", False)
@@ -678,9 +708,31 @@ def create_server():
     # ---------------------------------------------------------------------
     # Data loading helpers
     # ---------------------------------------------------------------------
+    def _selected_scans_from_state(tiff_dir):
+        """Resolve the Data-tab scan-number range to an explicit scan list.
+
+        Parses the scan ids from the TIFF filenames and keeps those within the
+        inclusive [frame_start, frame_end] window. A bound of 0 (or invalid) is
+        treated as "open" on that side. Returns None to load everything.
+        """
+        scans = _scan_numbers_in_dir(tiff_dir)
+        if not scans:
+            return None
+        smin = int(_float(getattr(state, "frame_start", 0), 0))
+        smax = int(_float(getattr(state, "frame_end", 0), 0))
+        if smin <= 0 and smax <= 0:
+            return None
+        lo = smin if smin > 0 else min(scans)
+        hi = smax if smax > 0 else max(scans)
+        if lo > hi:
+            lo, hi = hi, lo
+        selected = sorted({s for s in scans if lo <= s <= hi})
+        return selected or None
+
     def _load_experiment(loader_mode):
         setup_path = Path(_ensure_path(state.setup_path)).expanduser()
         tiff_dir = Path(_ensure_path(state.tiff_dir)).expanduser()
+        selected_scans = _selected_scans_from_state(str(tiff_dir))
         if loader_mode == "ISR":
             spec_path = Path(_ensure_path(state.spec_path)).expanduser()
             loader = RSMDataLoader_ISR(
@@ -688,6 +740,7 @@ def create_server():
                 str(setup_path),
                 str(tiff_dir),
                 use_dask=False,
+                selected_scans=selected_scans,
             )
             setup, ub, df = loader.load()
         else:
@@ -695,25 +748,11 @@ def create_server():
                 str(setup_path),
                 str(tiff_dir),
                 angle_step=_float(state.cms_angle_step, 1.0),
+                selected_scans=selected_scans,
             )
             setup, ub, df = loader.load()
         frames = None
         if df is not None and "intensity" in getattr(df, "columns", []):
-            # Restrict to the user-requested frame range so only that subset is
-            # retained in memory and exposed to the intensity slider. The end
-            # value is inclusive; end <= 0 (or beyond the data) is treated as
-            # "through the last frame".
-            n_total = len(df)
-            fs = max(0, int(_float(getattr(state, "frame_start", 0), 0)))
-            fe_inclusive = int(_float(getattr(state, "frame_end", 0), 0))
-            if fe_inclusive <= 0 or fe_inclusive >= n_total:
-                fe = n_total
-            else:
-                fe = fe_inclusive + 1  # make the inclusive bound exclusive
-            if fs >= fe:
-                fs = 0
-            if fs > 0 or fe < n_total:
-                df = df.iloc[fs:fe].reset_index(drop=True)
             frames = list(df["intensity"])
         return setup, ub, df, frames
 
@@ -1164,6 +1203,21 @@ def create_server():
         if clamped != _float(cms_angle_step, None):
             state.cms_angle_step = clamped
 
+    # When a TIFF directory is chosen, seed the scan-number range from the
+    # filenames so the first DEFAULT_FRAME_COUNT frames are pre-selected.
+    @state.change("tiff_dir")
+    def _on_tiff_dir_change(tiff_dir=None, **kwargs):
+        scans = _scan_numbers_in_dir(tiff_dir)
+        if not scans:
+            return
+        first = scans[:DEFAULT_FRAME_COUNT]
+        state.frame_start = int(first[0])
+        state.frame_end = int(first[-1])
+        _set_status(
+            f"Found {len(scans)} scan(s); defaulting to the first {len(first)} "
+            f"(scans {first[0]}\u2013{first[-1]})."
+        )
+
     with DivLayout(server) as layout:
         # NOTE: VtkRemoteView is instantiated later, inside the right-hand 3D
         # view panel (which has a defined non-zero size). Do NOT create a
@@ -1252,7 +1306,7 @@ def create_server():
                         style=_inp + " cursor:pointer;",
                     )
 
-                    html.Label("Frame range (start / end, end 0 = all)", style=_lbl)
+                    html.Label("Scans (start / end, end 0 = all)", style=_lbl)
                     with html.Div(style="display:flex; gap:8px;"):
                         html.Input(
                             v_model=("frame_start", 0),
