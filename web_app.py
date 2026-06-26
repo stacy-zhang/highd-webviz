@@ -295,6 +295,51 @@ def _parse_scan_list(text: Optional[str]) -> list:
     return sorted(out)
 
 
+def _parse_ub_matrix(text: Optional[str]) -> Optional[np.ndarray]:
+    """Parse a UB matrix string into an ndarray (mirrors the napari widget).
+
+    Rows are separated by newlines; values within a row by commas/whitespace.
+    Returns None when the text is blank. Raises ValueError on ragged rows.
+    """
+    stripped = _ensure_path(text)
+    if not stripped:
+        return None
+    rows = []
+    for line in stripped.splitlines():
+        parts = [p for p in re.split(r"[,\s]+", line.strip()) if p]
+        if parts:
+            rows.append([float(p) for p in parts])
+    if not rows:
+        return None
+    width = len(rows[0])
+    if any(len(row) != width for row in rows):
+        raise ValueError("UB rows must have equal length.")
+    return np.array(rows, dtype=float)
+
+
+def _format_ub_matrix(ub: Optional[object]) -> str:
+    """Format a UB matrix (loaded from a profile) into editable text."""
+    if ub is None:
+        return ""
+    try:
+        arr = np.asarray(ub, dtype=float)
+    except (TypeError, ValueError):
+        return str(ub)
+    if arr.ndim == 1:
+        return " ".join(f"{v:.6g}" for v in arr)
+    if arr.ndim == 2:
+        return "\n".join(" ".join(f"{v:.6g}" for v in row) for row in arr)
+    return np.array2string(arr, precision=6, separator=" ")
+
+
+def _parse_axes_list(text: Optional[str]) -> list:
+    """Split a goniometer-axis string like "x+, y+, z-" into a list."""
+    text = _ensure_path(text)
+    if not text:
+        return []
+    return [p.strip() for p in re.split(r"[,\s]+", text) if p.strip()]
+
+
 # partly copied from resview_widget.py
 DEFAULTS_ENV = "RSM3D_DEFAULTS_YAML"
 # The bundled defaults YAML lives inside the napari_resview package, not next to
@@ -346,10 +391,20 @@ def create_server():
     state.setdefault("space", "q")
     state.setdefault("grid_size", 90)
     state.setdefault("normalize", "mean")
+    # UB orientation matrix (rows separated by newlines). Seeded with identity
+    # and overwritten with the loaded UB after Load Data; the user can edit it.
+    state.setdefault("ub_matrix", "1 0 0\n0 1 0\n0 0 1")
     state.setdefault("ub_includes_2pi", True)
-    state.setdefault("1_based_center", True)
+    # Vue v-model identifiers cannot start with a digit, so the 1-based-center
+    # flag uses the key ``one_based_center`` (the legacy ``1_based_center`` key
+    # was never wired to the UI).
+    state.setdefault("one_based_center", False)
+    # Sample/detector goniometer axis strings (mirror the napari widget
+    # defaults so the web build reproduces the same Q/HKL mapping).
+    state.setdefault("sample_axes", "x+, y+, z-")
+    state.setdefault("detector_axes", "x+")
     state.setdefault("fuzzy_gridder", False)
-    state.setdefault("width_fuzzy", 0.01) # range from 0 to 999999999
+    state.setdefault("width_fuzzy", 0.00) # range from 0 to 999999999
 
     # View tab
     state.setdefault("log_view", True)
@@ -962,17 +1017,32 @@ def create_server():
         except (TypeError, ValueError) as exc:
             _set_status(f"Setup override skipped: {exc}")
 
-    def _compute_builder(setup, ub, df):
-        builder = RSMBuilder(setup, ub, df, ub_includes_2pi=True)
+    def _compute_builder(setup, ub, df, sample_axes, detector_axes,
+                         ub_includes_2pi, center_is_one_based):
+        builder = RSMBuilder(
+            setup,
+            ub,
+            df,
+            sample_axes=sample_axes or None,
+            detector_axes=detector_axes or None,
+            ub_includes_2pi=ub_includes_2pi,
+            center_is_one_based=center_is_one_based,
+        )
         builder.compute_full(verbose=False)
         return builder
 
     def _regrid_volume(builder, grid_size):
-        return builder.regrid_xu(
+        fuzzy = bool(getattr(state, "fuzzy_gridder", False))
+        kwargs = dict(
             space=_ensure_path(state.space) or "q",
             grid_shape=(grid_size, grid_size, grid_size),
             normalize=_ensure_path(state.normalize) or "mean",
+            fuzzy=fuzzy,
         )
+        width = _float(getattr(state, "width_fuzzy", 0.0), 0.0)
+        if fuzzy and width > 0:
+            kwargs["width"] = width
+        return builder.regrid_xu(**kwargs)
 
     def _track(coro):
         """Run a coroutine as a cancellable task (for the Stop button)."""
@@ -1016,6 +1086,9 @@ def create_server():
             regrid_axes = None
             state.intensity_slider_show = False
             _populate_setup_fields(setup, frames)
+            # Reflect the loaded UB into the editable Build-tab field.
+            if ub is not None:
+                state.ub_matrix = _format_ub_matrix(ub)
             n = len(frames) if frames else 0
             _set_status(f"Data loaded ({n} frame(s)). Ready to build.")
         except asyncio.CancelledError:
@@ -1033,11 +1106,35 @@ def create_server():
             _set_status("Load data first.")
             return
         _apply_setup_overrides(current_setup)
+
+        # Parse the editable Build-tab parameters on the main thread (so a bad
+        # UB is reported before the worker runs). Fall back to the loaded UB
+        # when the field is blank.
+        try:
+            ub_arr = _parse_ub_matrix(getattr(state, "ub_matrix", ""))
+        except ValueError as exc:
+            _set_status(f"Invalid UB: {exc}")
+            return
+        if ub_arr is None:
+            ub_arr = current_ub
+        sample_axes = _parse_axes_list(getattr(state, "sample_axes", ""))
+        detector_axes = _parse_axes_list(getattr(state, "detector_axes", ""))
+        ub_includes_2pi = bool(getattr(state, "ub_includes_2pi", True))
+        center_is_one_based = bool(getattr(state, "one_based_center", False))
+
         loop = asyncio.get_event_loop()
         try:
             _set_status("Computing Q/HKL mapping...")
             current_builder = await loop.run_in_executor(
-                None, _compute_builder, current_setup, current_ub, current_df
+                None,
+                _compute_builder,
+                current_setup,
+                ub_arr,
+                current_df,
+                sample_axes,
+                detector_axes,
+                ub_includes_2pi,
+                center_is_one_based,
             )
             _set_status("RSM map built. Ready to regrid.")
         except asyncio.CancelledError:
@@ -1935,6 +2032,22 @@ def create_server():
                     html.Span("Build")
                     html.Span("{{ open_tab === 'build' ? '\u25BC' : '\u25B6' }}")
                 with html.Div(v_show="open_tab === 'build'", style=_panel):
+                    html.Label("UB matrix", style=_lbl)
+                    html.Textarea(
+                        v_model=("ub_matrix", ""),
+                        rows="3",
+                        style=_inp + " font-family:monospace; resize:vertical;",
+                    )
+                    with html.Label(style=_lbl + " display:flex; align-items:center; gap:6px; cursor:pointer;"):
+                        html.Input(type="checkbox", v_model=("ub_includes_2pi", True), style="margin:0; width:auto;")
+                        html.Span("UB includes 2\u03c0")
+                    with html.Label(style=_lbl + " display:flex; align-items:center; gap:6px; cursor:pointer;"):
+                        html.Input(type="checkbox", v_model=("one_based_center", False), style="margin:0; width:auto;")
+                        html.Span("1-based center")
+                    html.Label("Sample axes", style=_lbl)
+                    html.Input(v_model=("sample_axes", ""), type="text", placeholder="x+, y+, z-", style=_inp)
+                    html.Label("Detector axes", style=_lbl)
+                    html.Input(v_model=("detector_axes", ""), type="text", placeholder="x+", style=_inp)
                     html.Label("Space", style=_lbl)
                     with html.Select(v_model=("space", ""), style=_inp):
                         html.Option("Q-space", value="q")
@@ -1945,6 +2058,11 @@ def create_server():
                     with html.Select(v_model=("normalize", ""), style=_inp):
                         html.Option("mean", value="mean")
                         html.Option("sum", value="sum")
+                    with html.Label(style=_lbl + " display:flex; align-items:center; gap:6px; cursor:pointer;"):
+                        html.Input(type="checkbox", v_model=("fuzzy_gridder", False), style="margin:0; width:auto;")
+                        html.Span("Fuzzy gridder")
+                    html.Label("Fuzzy width", style=_lbl)
+                    html.Input(v_model=("width_fuzzy", ""), type="number", min="0", step="0.01", style=_inp)
                     with html.Div(style="display:flex; gap:8px; margin-top:14px;"):
                         html.Button("\U0001F527 Build RSM", click=ctrl.build_rsm, style=_btn)
                         html.Button("\U0001F9EE Regrid", click=ctrl.regrid, style=_btn)
