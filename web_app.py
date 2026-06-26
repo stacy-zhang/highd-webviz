@@ -340,6 +340,38 @@ def _parse_axes_list(text: Optional[str]) -> list:
     return [p.strip() for p in re.split(r"[,\s]+", text) if p.strip()]
 
 
+def _parse_grid_shape(
+    text: Optional[str],
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Parse a grid-shape string like "100,*,*" into a (nx, ny, nz) tuple.
+
+    Mirrors the napari widget's ``parse_grid_shape``. A single value ("100")
+    expands to "100,*,*". Any dimension given as ``*`` (or blank) becomes
+    ``None``, which tells ``regrid_xu`` to auto-scale that dimension from the
+    data extents. Raises ValueError on malformed input.
+    """
+    text = _ensure_path(text)
+    if not text:
+        return (None, None, None)
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) == 1:
+        parts += ["*", "*"]
+    if len(parts) != 3:
+        raise ValueError("Grid must be 'x,y,z' (y/z may be '*').")
+
+    def _one(p: str) -> Optional[int]:
+        if p in ("*", ""):
+            return None
+        if not p.isdigit():
+            raise ValueError(f"Bad grid value: '{p}'")
+        v = int(p)
+        if v <= 0:
+            raise ValueError("Grid values must be positive.")
+        return v
+
+    return tuple(_one(p) for p in parts)  # type: ignore[return-value]
+
+
 # partly copied from resview_widget.py
 DEFAULTS_ENV = "RSM3D_DEFAULTS_YAML"
 # The bundled defaults YAML lives inside the napari_resview package, not next to
@@ -389,7 +421,9 @@ def create_server():
 
     # Build tab
     state.setdefault("space", "q")
-    state.setdefault("grid_size", 90)
+    # Grid shape as "nx,ny,nz"; ny/nz may be "*" to auto-scale from the data
+    # extents. A single value ("100") expands to "100,*,*".
+    state.setdefault("grid_shape", "100,*,*")
     state.setdefault("normalize", "mean")
     # UB orientation matrix (rows separated by newlines). Seeded with identity
     # and overwritten with the loaded UB after Load Data; the user can edit it.
@@ -1031,13 +1065,18 @@ def create_server():
         builder.compute_full(verbose=False)
         return builder
 
-    def _regrid_volume(builder, grid_size):
+    def _regrid_volume(builder, grid_shape):
         fuzzy = bool(getattr(state, "fuzzy_gridder", False))
         kwargs = dict(
             space=_ensure_path(state.space) or "q",
-            grid_shape=(grid_size, grid_size, grid_size),
+            grid_shape=grid_shape,
             normalize=_ensure_path(state.normalize) or "mean",
             fuzzy=fuzzy,
+            # Accumulate the scattered points frame-by-frame (mirrors the napari
+            # widget). Without streaming, regrid_xu ravels every frame's points
+            # into one giant array, which can need gigabytes of RAM and fail to
+            # allocate for large scans.
+            stream=True,
         )
         width = _float(getattr(state, "width_fuzzy", 0.0), 0.0)
         if fuzzy and width > 0:
@@ -1151,12 +1190,23 @@ def create_server():
         if current_builder is None:
             _set_status("Build the RSM map first.")
             return
+        # Parse the grid-shape string on the main thread so a malformed value
+        # is reported before the worker runs. nx is required; ny/nz may be
+        # auto-scaled ("*").
+        try:
+            grid_shape = _parse_grid_shape(getattr(state, "grid_shape", ""))
+        except ValueError as exc:
+            _set_status(f"Invalid grid: {exc}")
+            return
+        if grid_shape[0] is None:
+            _set_status("Grid X (first value) is required, e.g. 90,*,*")
+            return
         loop = asyncio.get_event_loop()
         try:
-            grid_size = max(16, int(_float(state.grid_size, 90)))
-            _set_status(f"Regridding to {grid_size}³ volume...")
+            shape_label = ", ".join("*" if d is None else str(d) for d in grid_shape)
+            _set_status(f"Regridding to ({shape_label}) volume...")
             volume, axes = await loop.run_in_executor(
-                None, _regrid_volume, current_builder, grid_size
+                None, _regrid_volume, current_builder, grid_shape
             )
             regrid_volume, regrid_axes = volume, axes
             state.scalar_range = (
@@ -2052,8 +2102,13 @@ def create_server():
                     with html.Select(v_model=("space", ""), style=_inp):
                         html.Option("Q-space", value="q")
                         html.Option("HKL", value="hkl")
-                    html.Label("Grid size", style=_lbl)
-                    html.Input(v_model=("grid_size", ""), type="number", min="16", step="8", style=_inp)
+                    html.Label("Grid (x,y,z), '*' allowed", style=_lbl)
+                    html.Input(
+                        v_model=("grid_shape", ""),
+                        type="text",
+                        placeholder="100,*,*",
+                        style=_inp,
+                    )
                     html.Label("Normalize", style=_lbl)
                     with html.Select(v_model=("normalize", ""), style=_inp):
                         html.Option("mean", value="mean")
