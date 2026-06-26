@@ -1,5 +1,6 @@
 import os
 import asyncio
+import math
 import time
 from pathlib import Path
 import pathlib
@@ -11,15 +12,23 @@ import re
 
 import numpy as np
 import vtkmodules.vtkRenderingOpenGL2  # noqa: F401
-from vtkmodules.vtkCommonCore import vtkLookupTable # maps raw scalar data to colors (RGBA)
-from vtkmodules.vtkCommonDataModel import vtkImageData, vtkPiecewiseFunction
+from vtkmodules.vtkCommonCore import vtkLookupTable, vtkPoints # maps raw scalar data to colors (RGBA)
+from vtkmodules.vtkCommonDataModel import (
+    vtkCellArray,
+    vtkImageData,
+    vtkLine,
+    vtkPiecewiseFunction,
+    vtkPolyData,
+    vtkPolyLine,
+)
 from vtkmodules.vtkCommonTransforms import vtkTransform
-from vtkmodules.vtkFiltersCore import vtkProbeFilter
+from vtkmodules.vtkFiltersCore import vtkGlyph3D, vtkProbeFilter
 from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
-from vtkmodules.vtkFiltersSources import vtkCylinderSource, vtkSphereSource # generates a cylinder or sphere mesh (for cylindrical/spherical slicing)
+from vtkmodules.vtkFiltersSources import vtkCylinderSource, vtkRegularPolygonSource, vtkSphereSource # generates a cylinder or sphere mesh (for cylindrical/spherical slicing)
 from vtkmodules.vtkRenderingCore import (
     vtkActor,
     vtkColorTransferFunction,
+    vtkCoordinate,  # converts between viewport/world coordinate systems
     vtkImageSlice, 
     vtkPolyDataMapper,
     vtkRenderer,
@@ -27,6 +36,10 @@ from vtkmodules.vtkRenderingCore import (
     vtkRenderWindowInteractor,
     vtkVolume,
     vtkVolumeProperty,
+)
+from vtkmodules.vtkInteractionStyle import (  # camera vs. locked styles for the ROI selector
+    vtkInteractorStyleTrackballCamera,
+    vtkInteractorStyleUser,
 )
 from vtkmodules.vtkRenderingImage import vtkImageResliceMapper # maps a 3D volume to a 2D slice plane
 from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkSmartVolumeMapper
@@ -384,6 +397,9 @@ def create_server():
     state.setdefault("intensity_slider_show", False)
     state.setdefault("intensity_frame_index", 0)
     state.setdefault("intensity_frame_max", 0)
+    # When True, an adjustable ROI rectangle is drawn over the intensity frame
+    # viewer; dragging/resizing it auto-fills the Crop row/col inputs.
+    state.setdefault("roi_show", True)
     # True while the frame slider is auto-advancing (Play). Drives the
     # play/stop button label and the playback loop's keep-running check.
     state.setdefault("intensity_playing", False)
@@ -478,6 +494,121 @@ def create_server():
     intensity_actor.VisibilityOff()
     renderer.AddViewProp(intensity_actor)
 
+    # --- Intensity ROI selector -------------------------------------------
+    # An adjustable rectangle drawn over the intensity frame. It lives in image
+    # (world) coordinates at z>0 (just in front of the frame), so its corners
+    # map directly to (col, row) pixel indices that fill the Crop inputs
+    # (mirrors the napari "Crop from ROI" workflow). The user can drag the body
+    # to move it, drag the corner/edge disks to resize, and drag the top disk to
+    # rotate; the axis-aligned bounding box of the (possibly rotated) corners
+    # defines the crop, exactly like napari.
+    roi_state = {
+        "active": False,
+        "cx": 0.0, "cy": 0.0,        # center (image coords)
+        "hw": 0.0, "hh": 0.0,        # half width / half height
+        "angle": 0.0,                # radians, CCW
+        "handle_r": 1.0,             # handle disk radius (world units)
+        "z": 1.0,                    # small +z offset so the gizmo draws on top
+        "grab": None,                # which part is being dragged
+        "grab_offset": (0.0, 0.0),
+        "fixed": (0.0, 0.0),         # fixed reference point during a resize
+    }
+
+    # Rectangle outline (closed polyline through the 4 corners).
+    roi_outline_pts = vtkPoints()
+    roi_outline_pts.SetNumberOfPoints(4)
+    roi_outline_poly = vtkPolyData()
+    roi_outline_poly.SetPoints(roi_outline_pts)
+    _roi_outline_cells = vtkCellArray()
+    _roi_outline_line = vtkPolyLine()
+    _roi_outline_line.GetPointIds().SetNumberOfIds(5)
+    for _i in range(4):
+        _roi_outline_line.GetPointIds().SetId(_i, _i)
+    _roi_outline_line.GetPointIds().SetId(4, 0)
+    _roi_outline_cells.InsertNextCell(_roi_outline_line)
+    roi_outline_poly.SetLines(_roi_outline_cells)
+    roi_outline_mapper = vtkPolyDataMapper()
+    roi_outline_mapper.SetInputData(roi_outline_poly)
+    roi_outline_actor = vtkActor()
+    roi_outline_actor.SetMapper(roi_outline_mapper)
+    roi_outline_actor.GetProperty().SetColor(1.0, 0.9, 0.1)
+    roi_outline_actor.GetProperty().SetLineWidth(2.0)
+    roi_outline_actor.GetProperty().LightingOff()
+    roi_outline_actor.PickableOff()
+    roi_outline_actor.VisibilityOff()
+    renderer.AddActor(roi_outline_actor)
+
+    # Eight resize handles (4 corners + 4 edge midpoints) as filled disks.
+    roi_handle_pts = vtkPoints()
+    roi_handle_pts.SetNumberOfPoints(8)
+    roi_handle_poly = vtkPolyData()
+    roi_handle_poly.SetPoints(roi_handle_pts)
+    roi_handle_src = vtkRegularPolygonSource()
+    roi_handle_src.SetNumberOfSides(24)
+    roi_handle_src.GeneratePolygonOn()
+    roi_handle_src.SetNormal(0.0, 0.0, 1.0)
+    roi_handle_src.SetRadius(1.0)
+    roi_handle_glyph = vtkGlyph3D()
+    roi_handle_glyph.SetInputData(roi_handle_poly)
+    roi_handle_glyph.SetSourceConnection(roi_handle_src.GetOutputPort())
+    roi_handle_glyph.SetScaleModeToDataScalingOff()
+    roi_handle_glyph.SetScaleFactor(1.0)
+    roi_handle_mapper = vtkPolyDataMapper()
+    roi_handle_mapper.SetInputConnection(roi_handle_glyph.GetOutputPort())
+    roi_handle_mapper.ScalarVisibilityOff()
+    roi_handle_actor = vtkActor()
+    roi_handle_actor.SetMapper(roi_handle_mapper)
+    roi_handle_actor.GetProperty().SetColor(1.0, 0.9, 0.1)
+    roi_handle_actor.GetProperty().LightingOff()
+    roi_handle_actor.PickableOff()
+    roi_handle_actor.VisibilityOff()
+    renderer.AddActor(roi_handle_actor)
+
+    # Rotation handle (a disk above the top edge) plus a connector line.
+    roi_rot_src = vtkRegularPolygonSource()
+    roi_rot_src.SetNumberOfSides(24)
+    roi_rot_src.GeneratePolygonOn()
+    roi_rot_src.SetNormal(0.0, 0.0, 1.0)
+    roi_rot_src.SetRadius(1.0)
+    roi_rot_mapper = vtkPolyDataMapper()
+    roi_rot_mapper.SetInputConnection(roi_rot_src.GetOutputPort())
+    roi_rot_mapper.ScalarVisibilityOff()
+    roi_rot_actor = vtkActor()
+    roi_rot_actor.SetMapper(roi_rot_mapper)
+    roi_rot_actor.GetProperty().SetColor(0.3, 1.0, 0.45)
+    roi_rot_actor.GetProperty().LightingOff()
+    roi_rot_actor.PickableOff()
+    roi_rot_actor.VisibilityOff()
+    renderer.AddActor(roi_rot_actor)
+
+    roi_rotline_pts = vtkPoints()
+    roi_rotline_pts.SetNumberOfPoints(2)
+    roi_rotline_poly = vtkPolyData()
+    roi_rotline_poly.SetPoints(roi_rotline_pts)
+    _roi_rotline_cells = vtkCellArray()
+    _roi_rotline_seg = vtkLine()
+    _roi_rotline_seg.GetPointIds().SetId(0, 0)
+    _roi_rotline_seg.GetPointIds().SetId(1, 1)
+    _roi_rotline_cells.InsertNextCell(_roi_rotline_seg)
+    roi_rotline_poly.SetLines(_roi_rotline_cells)
+    roi_rotline_mapper = vtkPolyDataMapper()
+    roi_rotline_mapper.SetInputData(roi_rotline_poly)
+    roi_rotline_actor = vtkActor()
+    roi_rotline_actor.SetMapper(roi_rotline_mapper)
+    roi_rotline_actor.GetProperty().SetColor(0.3, 1.0, 0.45)
+    roi_rotline_actor.GetProperty().SetLineWidth(1.5)
+    roi_rotline_actor.GetProperty().LightingOff()
+    roi_rotline_actor.PickableOff()
+    roi_rotline_actor.VisibilityOff()
+    renderer.AddActor(roi_rotline_actor)
+
+    # Interactor styles: the default trackball drives the 3D volume; a no-op
+    # style locks the camera straight-on while the 2D ROI selector is active so
+    # the screen<->image coordinate mapping stays exact.
+    roi_trackball_style = vtkInteractorStyleTrackballCamera()
+    roi_lock_style = vtkInteractorStyleUser()
+    interactor.SetInteractorStyle(roi_trackball_style)
+
     current_volume = None
     current_axes = None
     current_builder = None
@@ -486,6 +617,10 @@ def create_server():
     current_ub = None
     current_df = None
     current_frames = None
+    # Pixel dimensions (cols, rows) of the currently displayed intensity frame;
+    # used to clamp ROI-derived crop indices. None until a frame is shown.
+    intensity_nx = None
+    intensity_ny = None
     # Regridded volume awaiting display (View RSM renders it).
     regrid_volume = None
     regrid_axes = None
@@ -555,6 +690,8 @@ def create_server():
         nonlocal current_volume, current_axes, render_range, current_image
         # Switching to a volume view supersedes the 2D intensity-frame viewer.
         intensity_actor.VisibilityOff()
+        _roi_set_active(False)  # the ROI selector only applies to the intensity view
+        renderer.GetActiveCamera().ParallelProjectionOff()  # restore 3D perspective
         state.intensity_slider_show = False
         state.intensity_playing = False  # halt any in-progress frame playback
         current_volume = np.asarray(volume, dtype=np.float32)
@@ -950,6 +1087,240 @@ def create_server():
         _set_volume_data(regrid_volume, regrid_axes)
         _set_status("RSM volume displayed.")
 
+    # ---------------------------------------------------------------------
+    # Intensity ROI selector helpers
+    # ---------------------------------------------------------------------
+    MIN_HALF = 1.0  # smallest allowed half-extent (pixels) when resizing
+
+    def _roi_axes():
+        a = roi_state["angle"]
+        return (math.cos(a), math.sin(a)), (-math.sin(a), math.cos(a))
+
+    def _roi_corners():
+        cx, cy = roi_state["cx"], roi_state["cy"]
+        hw, hh = roi_state["hw"], roi_state["hh"]
+        (ux, uy), (vx, vy) = _roi_axes()
+        return [
+            (cx - hw * ux - hh * vx, cy - hw * uy - hh * vy),  # c0: -u -v
+            (cx + hw * ux - hh * vx, cy + hw * uy - hh * vy),  # c1: +u -v
+            (cx + hw * ux + hh * vx, cy + hw * uy + hh * vy),  # c2: +u +v
+            (cx - hw * ux + hh * vx, cy - hw * uy + hh * vy),  # c3: -u +v
+        ]
+
+    def _roi_edge_mids():
+        cx, cy = roi_state["cx"], roi_state["cy"]
+        hw, hh = roi_state["hw"], roi_state["hh"]
+        (ux, uy), (vx, vy) = _roi_axes()
+        return {
+            "eR": (cx + hw * ux, cy + hw * uy),
+            "eT": (cx + hh * vx, cy + hh * vy),
+            "eL": (cx - hw * ux, cy - hw * uy),
+            "eB": (cx - hh * vx, cy - hh * vy),
+        }
+
+    def _roi_rot_pos():
+        cx, cy = roi_state["cx"], roi_state["cy"]
+        hh = roi_state["hh"]
+        (_ux, _uy), (vx, vy) = _roi_axes()
+        pad = roi_state["handle_r"] * 3.0
+        return (cx + (hh + pad) * vx, cy + (hh + pad) * vy)
+
+    def _roi_refresh_actors():
+        z = roi_state["z"]
+        corners = _roi_corners()
+        for i, (px, py) in enumerate(corners):
+            roi_outline_pts.SetPoint(i, px, py, z)
+        roi_outline_pts.Modified()
+        mids = _roi_edge_mids()
+        handle_pts = corners + [mids["eR"], mids["eT"], mids["eL"], mids["eB"]]
+        for i, (px, py) in enumerate(handle_pts):
+            roi_handle_pts.SetPoint(i, px, py, z)
+        roi_handle_pts.Modified()
+        roi_handle_glyph.Modified()
+        rx, ry = _roi_rot_pos()
+        roi_rot_src.SetCenter(rx, ry, z)
+        etx, ety = mids["eT"]
+        roi_rotline_pts.SetPoint(0, etx, ety, z)
+        roi_rotline_pts.SetPoint(1, rx, ry, z)
+        roi_rotline_pts.Modified()
+
+    def _roi_set_visible(show):
+        for actor in (
+            roi_outline_actor, roi_handle_actor, roi_rot_actor, roi_rotline_actor
+        ):
+            actor.SetVisibility(1 if show else 0)
+
+    def _world_to_display(px, py):
+        c = vtkCoordinate()
+        c.SetCoordinateSystemToWorld()
+        c.SetValue(px, py, roi_state["z"])
+        return c.GetComputedDoubleDisplayValue(renderer)
+
+    def _display_to_world(dx, dy):
+        c = vtkCoordinate()
+        c.SetCoordinateSystemToDisplay()
+        c.SetValue(float(dx), float(dy), 0.0)
+        wx, wy, _wz = c.GetComputedWorldValue(renderer)
+        return wx, wy
+
+    def _disp_dist(world_pt, dx, dy):
+        sx, sy = _world_to_display(world_pt[0], world_pt[1])
+        return math.hypot(sx - dx, sy - dy)
+
+    def _point_in_roi(px, py):
+        (ux, uy), (vx, vy) = _roi_axes()
+        ddx, ddy = px - roi_state["cx"], py - roi_state["cy"]
+        return (
+            abs(ddx * ux + ddy * uy) <= roi_state["hw"]
+            and abs(ddx * vx + ddy * vy) <= roi_state["hh"]
+        )
+
+    def _roi_hit_test(dx, dy):
+        thr = 11.0  # px pick tolerance
+        if _disp_dist(_roi_rot_pos(), dx, dy) <= thr:
+            return "rot"
+        for i, corner in enumerate(_roi_corners()):
+            if _disp_dist(corner, dx, dy) <= thr:
+                return f"c{i}"
+        for key, mid in _roi_edge_mids().items():
+            if _disp_dist(mid, dx, dy) <= thr:
+                return key
+        wx, wy = _display_to_world(dx, dy)
+        if _point_in_roi(wx, wy):
+            return "body"
+        return None
+
+    def _roi_update_crop_state():
+        if intensity_nx is None or intensity_ny is None:
+            return
+        corners = _roi_corners()
+        xs = [c[0] for c in corners]
+        ys = [c[1] for c in corners]
+        col_lo = max(0, min(int(round(min(xs))), intensity_nx - 1))
+        col_hi = max(0, min(int(round(max(xs))), intensity_nx - 1))
+        row_lo = max(0, min(int(round(min(ys))), intensity_ny - 1))
+        row_hi = max(0, min(int(round(max(ys))), intensity_ny - 1))
+        if col_hi <= col_lo:
+            col_hi = min(intensity_nx - 1, col_lo + 1)
+        if row_hi <= row_lo:
+            row_hi = min(intensity_ny - 1, row_lo + 1)
+        state.crop_col_min = col_lo
+        state.crop_col_max = col_hi
+        state.crop_row_min = row_lo
+        state.crop_row_max = row_hi
+        state.flush()
+
+    def _roi_render():
+        render_window.Render()
+        if remote_view is not None:
+            remote_view.update()
+
+    def _roi_init_geometry():
+        """Center the ROI box over the frame at ~60% of each dimension."""
+        nx = intensity_nx or 1
+        ny = intensity_ny or 1
+        roi_state["cx"] = (nx - 1) / 2.0
+        roi_state["cy"] = (ny - 1) / 2.0
+        roi_state["hw"] = max(MIN_HALF, nx * 0.3)
+        roi_state["hh"] = max(MIN_HALF, ny * 0.3)
+        roi_state["angle"] = 0.0
+        roi_state["handle_r"] = max(2.0, 0.012 * max(nx, ny))
+        roi_state["z"] = max(1.0, 0.01 * max(nx, ny))
+        roi_state["grab"] = None
+        roi_handle_src.SetRadius(roi_state["handle_r"])
+        roi_rot_src.SetRadius(roi_state["handle_r"])
+
+    def _roi_set_active(active):
+        roi_state["active"] = bool(active)
+        if active:
+            interactor.SetInteractorStyle(roi_lock_style)
+            _roi_set_visible(True)
+            _roi_refresh_actors()
+        else:
+            roi_state["grab"] = None
+            _roi_set_visible(False)
+            interactor.SetInteractorStyle(roi_trackball_style)
+
+    def _roi_on_press(obj, event):
+        if not roi_state["active"]:
+            return
+        dx, dy = interactor.GetEventPosition()
+        grab = _roi_hit_test(dx, dy)
+        roi_state["grab"] = grab
+        if grab is None:
+            return
+        wx, wy = _display_to_world(dx, dy)
+        if grab == "body":
+            roi_state["grab_offset"] = (wx - roi_state["cx"], wy - roi_state["cy"])
+        elif grab in ("c0", "c1", "c2", "c3"):
+            opp = {"c0": 2, "c1": 3, "c2": 0, "c3": 1}[grab]
+            roi_state["fixed"] = _roi_corners()[opp]
+
+    def _roi_on_move(obj, event):
+        if not roi_state["active"] or roi_state["grab"] is None:
+            return
+        dx, dy = interactor.GetEventPosition()
+        wx, wy = _display_to_world(dx, dy)
+        g = roi_state["grab"]
+        (ux, uy), (vx, vy) = _roi_axes()
+        if g == "body":
+            ox, oy = roi_state["grab_offset"]
+            roi_state["cx"] = wx - ox
+            roi_state["cy"] = wy - oy
+        elif g == "rot":
+            roi_state["angle"] = (
+                math.atan2(wy - roi_state["cy"], wx - roi_state["cx"]) - math.pi / 2.0
+            )
+        elif g in ("c0", "c1", "c2", "c3"):
+            fx, fy = roi_state["fixed"]
+            ncx, ncy = (wx + fx) / 2.0, (wy + fy) / 2.0
+            ddx, ddy = wx - ncx, wy - ncy
+            roi_state["cx"], roi_state["cy"] = ncx, ncy
+            roi_state["hw"] = max(MIN_HALF, abs(ddx * ux + ddy * uy))
+            roi_state["hh"] = max(MIN_HALF, abs(ddx * vx + ddy * vy))
+        elif g in ("eR", "eL"):
+            proj = (wx - roi_state["cx"]) * ux + (wy - roi_state["cy"]) * uy
+            fixed_s = -roi_state["hw"] if g == "eR" else roi_state["hw"]
+            shift = (fixed_s + proj) / 2.0
+            roi_state["hw"] = max(MIN_HALF, abs(proj - fixed_s) / 2.0)
+            roi_state["cx"] += ux * shift
+            roi_state["cy"] += uy * shift
+        elif g in ("eT", "eB"):
+            proj = (wx - roi_state["cx"]) * vx + (wy - roi_state["cy"]) * vy
+            fixed_s = -roi_state["hh"] if g == "eT" else roi_state["hh"]
+            shift = (fixed_s + proj) / 2.0
+            roi_state["hh"] = max(MIN_HALF, abs(proj - fixed_s) / 2.0)
+            roi_state["cx"] += vx * shift
+            roi_state["cy"] += vy * shift
+        _roi_refresh_actors()
+        _roi_update_crop_state()
+        _roi_render()
+
+    def _roi_on_release(obj, event):
+        if roi_state["grab"] is not None:
+            roi_state["grab"] = None
+            _roi_update_crop_state()
+            _roi_render()
+
+    # Observe the forwarded mouse events (priority above the camera style so a
+    # grab on a handle/body edits the ROI rather than moving the camera).
+    interactor.AddObserver("LeftButtonPressEvent", _roi_on_press, 10.0)
+    interactor.AddObserver("MouseMoveEvent", _roi_on_move, 10.0)
+    interactor.AddObserver("LeftButtonReleaseEvent", _roi_on_release, 10.0)
+
+    @state.change("roi_show")
+    def _on_roi_show_change(roi_show=True, **kwargs):
+        # Only meaningful while the intensity frame viewer is active.
+        if not bool(getattr(state, "intensity_slider_show", False)):
+            return
+        if roi_show and intensity_nx is not None:
+            _roi_init_geometry()
+            _roi_set_active(True)
+            _roi_update_crop_state()
+        else:
+            _roi_set_active(False)
+        _roi_render()
+
     @ctrl.set("view_intensity")
     def view_intensity(**kwargs):
         if not current_frames:
@@ -973,10 +1344,20 @@ def create_server():
         except Exception as exc:
             _set_status(f"Intensity view error: {exc}")
             return
+        # Drop an adjustable ROI box on the frame and seed the Crop inputs from
+        # it so the user can move/resize/rotate it to refine the crop.
+        if bool(getattr(state, "roi_show", True)):
+            _roi_init_geometry()
+            _roi_set_active(True)
+            _roi_update_crop_state()
+        else:
+            _roi_set_active(False)
+        _roi_render()
         _set_status(f"Viewing intensity frames (0–{n - 1}). Use the slider to scrub.")
 
     def _show_intensity_frame(index, reset_camera=False):
         """Display a single raw intensity frame as a 2D image slice."""
+        nonlocal intensity_nx, intensity_ny
         if not current_frames:
             return
         n = len(current_frames)
@@ -1001,6 +1382,7 @@ def create_server():
         frange = _robust_percentiles(disp, (lo, hi))
 
         ny, nx = disp.shape
+        intensity_nx, intensity_ny = nx, ny
         image = vtkImageData()
         image.SetDimensions(nx, ny, 1)
         image.SetSpacing(1.0, 1.0, 1.0)
@@ -1025,6 +1407,9 @@ def create_server():
         intensity_actor.VisibilityOn()
 
         if reset_camera:
+            # Parallel projection + a straight-on reset keeps the display<->image
+            # coordinate mapping exact (and linear) for the ROI selector.
+            renderer.GetActiveCamera().ParallelProjectionOn()
             renderer.ResetCamera()
         render_window.Render()
         if remote_view is not None:
@@ -1131,6 +1516,22 @@ def create_server():
             current_builder = None
             regrid_volume = None
             regrid_axes = None
+            # Refresh the intensity viewer in place on the freshly cropped
+            # frames so the user sees the crop immediately, without having to
+            # click "View intensity" again.
+            if bool(getattr(state, "intensity_slider_show", False)) and current_frames:
+                n = len(current_frames)
+                state.intensity_frame_max = n - 1
+                idx = int(_float(getattr(state, "intensity_frame_index", 0), 0))
+                idx = max(0, min(idx, n - 1))
+                if int(_float(getattr(state, "intensity_frame_index", 0), 0)) != idx:
+                    state.intensity_frame_index = idx
+                _show_intensity_frame(idx, reset_camera=True)
+                if bool(getattr(state, "roi_show", True)):
+                    _roi_init_geometry()
+                    _roi_set_active(True)
+                    _roi_update_crop_state()
+                _roi_render()
             _set_status(
                 f"Crop applied: rows [{r0}, {r1}), cols [{c0}, {c1}). Rebuild required."
             )
@@ -1476,6 +1877,9 @@ def create_server():
                     with html.Div(style="display:flex; gap:8px;"):
                         html.Input(v_model=("crop_col_min", ""), type="number", placeholder="left", style="flex:1; min-width:0;")
                         html.Input(v_model=("crop_col_max", ""), type="number", placeholder="right", style="flex:1; min-width:0;")
+                    with html.Label(style=_lbl + " display:flex; align-items:center; gap:6px; cursor:pointer;"):
+                        html.Input(type="checkbox", v_model=("roi_show", True), style="margin:0; width:auto;")
+                        html.Span("Adjustable ROI box on intensity view")
                     html.Button("\U0001F532 Crop from ROI", click=ctrl.crop_from_roi, style="width:100%; margin-top:12px; padding:10px 8px; cursor:pointer;")
 
                 # ===================== BUILD TAB =====================
