@@ -1451,6 +1451,9 @@ def create_server():
         _update_interactor_style()
 
     # --- Beam-center cross helpers -----------------------------------------
+    # World space vs. display space: the cross is drawn in world space, but the user interacts with it in display space. 
+    # The cross's world-space position is stored in the state (exp_bc_w / exp_bc_h) and is used to update the cross actor's points. 
+    # When the user drags the cross, the display-space position is converted back to world space and pushed to the state.
     def _cross_position_from_state():
         """Place the cross at the beam center stored in exp_bc_w / exp_bc_h."""
         if intensity_nx is None or intensity_ny is None:
@@ -1463,7 +1466,8 @@ def create_server():
         # measured from the bottom (see _show_intensity_frame).
         cross_state["cy"] = float((ny - 1) - row)
 
-    def _cross_refresh_actors():
+    def _cross_refresh_actors(): 
+        """ Update the cross actor's points from the current state. """
         cx, cy = cross_state["cx"], cross_state["cy"]
         s = cross_state["size"]
         z = cross_state["z"]
@@ -1473,7 +1477,8 @@ def create_server():
         cross_pts.SetPoint(3, cx + s, cy, z)
         cross_pts.Modified()
 
-    def _cross_init_geometry():
+    def _cross_init_geometry(): 
+        """ Size the cross from the current frame dimensions and camera zoom. """
         nx = intensity_nx or 1
         ny = intensity_ny or 1
         cross_state["size"] = max(5.0, min(nx, ny) * 0.08)
@@ -1482,7 +1487,8 @@ def create_server():
         _cross_position_from_state()
         _cross_refresh_actors()
 
-    def _cross_set_active(active):
+    def _cross_set_active(active): 
+        """ Show/hide cross and update interacor style. """
         cross_state["active"] = bool(active)
         cross_actor.SetVisibility(1 if active else 0)
         if not active:
@@ -1500,7 +1506,11 @@ def create_server():
         qx, qy = ax + t * vx, ay + t * vy
         return math.hypot(px - qx, py - qy)
 
-    def _cross_hit_test(dx, dy):
+    def _cross_hit_test(dx, dy): 
+        """
+        Check if the display-space point (dx, dy) is within 9px of the cross. 
+        Need to do this because the cross is drawn with a fixed line width, so the actual world-space lines are too thin to reliably pick.
+        """
         cx, cy, s = cross_state["cx"], cross_state["cy"], cross_state["size"]
         top = _world_to_display(cx, cy + s)
         bot = _world_to_display(cx, cy - s)
@@ -1509,7 +1519,8 @@ def create_server():
         d = min(_seg_dist(dx, dy, top, bot), _seg_dist(dx, dy, left, right))
         return d <= 9.0
 
-    def _cross_set_world(wx, wy):
+    def _cross_set_world(wx, wy): 
+        """ Update the cross position from a world-space point (wx, wy) and push it to the Data-tab beam-center inputs. """
         if intensity_nx is None or intensity_ny is None:
             return
         nx, ny = intensity_nx, intensity_ny
