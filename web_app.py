@@ -219,11 +219,15 @@ def _crop_window_from_state(state) -> Optional[Tuple[Tuple[int, int], Tuple[int,
 
 
 def _adjust_setup_for_crop(setup, crop_window: Tuple[Tuple[int, int], Tuple[int, int]]):
-    (r0, _), (c0, _) = crop_window
+    # Shift the beam center by the crop origin and resize the detector to the
+    # crop dimensions, mirroring napari's on_crop_from_roi (new_yc = old_yc -
+    # y_min, new detector size = crop height/width). The beam center thus stays
+    # over the same physical pixel of the (now cropped) intensity map.
+    (r0, r1), (c0, c1) = crop_window
     setup.xcenter = max(0, int(setup.xcenter) - c0)
     setup.ycenter = max(0, int(setup.ycenter) - r0)
-    setup.xpixels = max(1, int(setup.xpixels) - c0)
-    setup.ypixels = max(1, int(setup.ypixels) - r0)
+    setup.xpixels = max(1, int(c1 - c0))
+    setup.ypixels = max(1, int(r1 - r0))
 
 
 def _crop_dataframe_intensity(df, crop_window):
@@ -2009,6 +2013,13 @@ def create_server():
             current_df = _crop_dataframe_intensity(current_df, crop_window)
             current_frames = list(current_df["intensity"])
             if current_setup is not None:
+                # Push the live Data-tab values (including any beam center the
+                # user dragged/typed on the intensity view) onto the setup
+                # FIRST, so the crop shift is applied to the current beam
+                # center -- not the stale loaded one. This mirrors napari's
+                # on_crop_from_roi, which shifts the live widget values by the
+                # crop origin so the cross stays put relative to the pattern.
+                _apply_setup_overrides(current_setup)
                 _adjust_setup_for_crop(current_setup, crop_window)
                 _populate_setup_fields(current_setup, current_frames)
             # Invalidate downstream products built from the un-cropped data.
