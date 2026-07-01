@@ -403,6 +403,9 @@ def create_server():
     state.setdefault("setup_path", yaml_path())
     state.setdefault("tiff_dir", "")
     state.setdefault("spec_path", "")
+    # ISR-only: restrict the load to HKL scans (maps to the loader's
+    # process_hklscan_only flag). Ignored in CMS mode.
+    state.setdefault("only_hkl", False)
     state.setdefault("cms_angle_step", 0.50) # range from 0 to 360, default 0.50 (every half-degree)
     # Scan-number selection, parsed from the TIFF filenames. Accepts a single
     # scan ("30") or an inclusive range / list ("17-20, 30"); empty = all.
@@ -1043,6 +1046,7 @@ def create_server():
                 str(tiff_dir),
                 use_dask=False,
                 selected_scans=selected_scans,
+                process_hklscan_only=bool(getattr(state, "only_hkl", False)),
             )
             setup, ub, df = loader.load()
         else:
@@ -2448,6 +2452,13 @@ def create_server():
                             click=(_fb_open, "['spec_path', 'file']"),
                             style=_inp + " cursor:pointer;",
                         )
+                        with html.Div(style="margin-top:8px;"):
+                            html.Input(
+                                v_model=("only_hkl", ""),
+                                type="checkbox",
+                                style="margin-right:8px;",
+                            )
+                            html.Span("Only HKL scans")
 
                     # CMS metadata
                     with html.Div(v_show="loader_mode === 'CMS'"):
