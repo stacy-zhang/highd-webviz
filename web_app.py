@@ -523,6 +523,11 @@ def create_server():
     # Which tab is expanded ("" = all collapsed; one of data/build/view/analysis)
     state.setdefault("open_tab", "")
 
+    # Right-side layer control panel: the list of scene layers available for the
+    # active view. Each entry is {"key", "name", "visible"} and drives one row
+    # (name + eye toggle) in the panel. Rebuilt whenever the active view changes.
+    state.setdefault("layers", [])
+
     renderer = vtkRenderer()
     renderer.SetBackground(0.10, 0.10, 0.12)
 
@@ -877,6 +882,7 @@ def create_server():
         renderer.ResetCamera()
         _update_rendering()
         _update_all_slices()
+        _rebuild_volume_layers()
         return current_volume, current_axes
         # ---------------------------------------------------------------------
     # Analysis: orthogonal / cylindrical / spherical slicing helpers
@@ -1010,6 +1016,7 @@ def create_server():
     @ctrl.set("update_slices")
     def update_slices(**kwargs):
         _update_all_slices()
+        _rebuild_volume_layers()
         render_window.Render()
         if remote_view is not None:
             remote_view.update()
@@ -1788,11 +1795,15 @@ def create_server():
         if not bool(getattr(state, "intensity_slider_show", False)):
             return
         if roi_show and intensity_nx is not None:
-            _roi_init_geometry()
-            _roi_set_active(True)
+            # Only seed a fresh box when the ROI isn't already on screen, so
+            # re-showing a hidden ROI keeps the user's previous placement.
+            if not roi_state["active"]:
+                _roi_init_geometry()
+                _roi_set_active(True)
             _roi_update_crop_state()
         else:
             _roi_set_active(False)
+        _sync_layer_visible("roi", bool(roi_show))
         _roi_render()
 
     @state.change("exp_bc_w", "exp_bc_h")
@@ -1841,6 +1852,11 @@ def create_server():
         else:
             _roi_set_active(False)
         _roi_render()
+        _set_layers([
+            ("intensity_map", "Intensity"),
+            ("roi", "ROI"),
+            ("cross", "Beam Center"),
+        ])
         _set_status(f"Viewing intensity frames (0–{n - 1}). Use the slider to scrub.")
 
     def _show_intensity_frame(index, reset_camera=False):
@@ -2194,6 +2210,109 @@ def create_server():
         if remote_view is not None:
             remote_view.update()
 
+    # ---------------------------------------------------------------------
+    # Layer control panel (right side)
+    # ---------------------------------------------------------------------
+    # Maps each layer key to the VTK prop that backs it, so we can read the
+    # current visibility when (re)building the panel.
+    def _layer_prop(key):
+        return {
+            "volume": volume_actor,
+            "intensity_map": intensity_actor,
+            "roi": roi_outline_actor,
+            "cross": cross_actor,
+            "slice_x": slice_actors["x"],
+            "slice_y": slice_actors["y"],
+            "slice_z": slice_actors["z"],
+            "cylinder": cyl_actor,
+            "sphere": sph_actor,
+        }.get(key)
+
+    def _layer_is_visible(key):
+        prop = _layer_prop(key)
+        return bool(prop.GetVisibility()) if prop is not None else True
+
+    def _set_layers(items):
+        """Rebuild the right-side layer list from (key, name) pairs."""
+        state.layers = [
+            {"key": key, "name": name, "visible": _layer_is_visible(key)}
+            for key, name in items
+        ]
+
+    def _rebuild_volume_layers():
+        """List the layers present in the 3D volume view (volume + active slices)."""
+        if bool(getattr(state, "intensity_slider_show", False)):
+            return  # the intensity view manages its own layer list
+        items = [("volume", "RSM Volume")]
+        for ax, lbl in (("x", "Slice X"), ("y", "Slice Y"), ("z", "Slice Z")):
+            if slice_actors[ax].GetVisibility():
+                items.append((f"slice_{ax}", lbl))
+        if cyl_actor.GetVisibility():
+            items.append(("cylinder", "Cylinder"))
+        if sph_actor.GetVisibility():
+            items.append(("sphere", "Sphere"))
+        _set_layers(items)
+
+    def _sync_layer_visible(key, visible):
+        """Reflect an external visibility change (e.g. a tab checkbox) in the panel."""
+        layers = state.layers or []
+        changed = False
+        updated = []
+        for item in layers:
+            if item["key"] == key and item["visible"] != bool(visible):
+                item = {**item, "visible": bool(visible)}
+                changed = True
+            updated.append(item)
+        if changed:
+            state.layers = updated
+
+    def _apply_layer_visibility(key, visible):
+        """Show/hide the prop(s) backing a layer, keeping related controls in sync."""
+        visible = bool(visible)
+        if key == "volume":
+            volume_actor.SetVisibility(1 if visible else 0)
+        elif key == "intensity_map":
+            intensity_actor.SetVisibility(1 if visible else 0)
+        elif key == "roi":
+            if visible and intensity_nx is not None:
+                _roi_set_active(True)
+                _roi_update_crop_state()
+            else:
+                _roi_set_active(False)
+            if bool(getattr(state, "roi_show", True)) != visible:
+                state.roi_show = visible
+        elif key == "cross":
+            _cross_set_active(visible)
+        elif key in ("slice_x", "slice_y", "slice_z"):
+            axis = key[-1]
+            setattr(state, f"slice_{axis}_show", visible)
+            _update_ortho_slice(axis)
+        elif key == "cylinder":
+            state.cyl_show = visible
+            _update_cylinder()
+        elif key == "sphere":
+            state.sph_show = visible
+            _update_sphere()
+
+    @ctrl.set("toggle_layer")
+    def toggle_layer(key=None, **kwargs):
+        if not key:
+            return
+        layers = [dict(item) for item in (state.layers or [])]
+        target = None
+        for item in layers:
+            if item["key"] == key:
+                item["visible"] = not item["visible"]
+                target = item
+                break
+        if target is None:
+            return
+        _apply_layer_visibility(key, target["visible"])
+        state.layers = layers
+        render_window.Render()
+        if remote_view is not None:
+            remote_view.update()
+
     def _fb_target_label(target: str) -> str:
         labels = {
             "setup_path": "YAML setup file",
@@ -2358,6 +2477,23 @@ def create_server():
             "border: 1px solid #44444a; border-radius: 2px; }"
             "input.frame-slider::-moz-range-thumb { width: 16px; height: 20px; border: none; "
             "background: #6aa9ff; border: 1px solid #cfe2ff; border-radius: 2px; }"
+            # Layer-panel eye toggle icons (open eye / slashed eye).
+            ".layer-eye { width: 20px; height: 20px; display: inline-block; "
+            "background-repeat: no-repeat; background-position: center; "
+            "background-size: 18px 18px; }"
+            ".layer-eye-on { background-image: url(\"data:image/svg+xml,"
+            "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' "
+            "fill='none' stroke='%23dcdce0' stroke-width='2' stroke-linecap='round' "
+            "stroke-linejoin='round'><path d='M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z'/>"
+            "<circle cx='12' cy='12' r='3'/></svg>\"); }"
+            ".layer-eye-off { opacity: 0.6; background-image: url(\"data:image/svg+xml,"
+            "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' "
+            "fill='none' stroke='%23808088' stroke-width='2' stroke-linecap='round' "
+            "stroke-linejoin='round'>"
+            "<path d='M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94'/>"
+            "<path d='M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19'/>"
+            "<path d='M14.12 14.12a3 3 0 1 1-4.24-4.24'/>"
+            "<line x1='1' y1='1' x2='23' y2='23'/></svg>\"); }"
         )
         with html.Div(  # top header bar with the sidebar toggle and title
             style=(
@@ -2780,6 +2916,51 @@ def create_server():
                         style=(
                             "min-width:80px; text-align:right; font-size:0.85rem; "
                             "font-variant-numeric:tabular-nums;"
+                        ),
+                    )
+
+            # Right-side layer control panel. Lists the scene layers for the
+            # active view; each row shows the layer name centered with an eye
+            # icon on the left that toggles that layer's visibility.
+            with html.Div(
+                v_show="layers && layers.length",
+                style=(
+                    "flex:0 0 210px; height:100%; padding:12px; overflow:auto; "
+                    "background:#16161a; color:#dddddd; border-left:1px solid #2a2a2e; "
+                    "font-family:sans-serif;"
+                ),
+            ):
+                html.Strong(
+                    "Layers",
+                    style="display:block; margin-bottom:10px; font-size:0.95rem;",
+                )
+                with html.Div(
+                    v_for="(layer, li) in layers",
+                    key="layer.key",
+                    style=(
+                        "position:relative; display:flex; align-items:center; "
+                        "height:36px; margin-bottom:8px; padding:0 10px; "
+                        "background:#2a2a2e; border:1px solid #44444a; "
+                        "border-radius:6px; user-select:none;"
+                    ),
+                ):
+                    with html.Button(
+                        click=(ctrl.toggle_layer, "[layer.key]"),
+                        title="Show / hide this layer",
+                        style=(
+                            "position:relative; z-index:2; display:flex; align-items:center; "
+                            "justify-content:center; width:24px; height:24px; padding:0; margin:0; "
+                            "background:none; border:none; cursor:pointer;"
+                        ),
+                    ):
+                        html.Span(classes="layer-eye layer-eye-on", v_show="layer.visible")
+                        html.Span(classes="layer-eye layer-eye-off", v_show="!layer.visible")
+                    html.Span(
+                        "{{ layer.name }}",
+                        style=(
+                            "position:absolute; left:0; right:0; text-align:center; "
+                            "pointer-events:none; padding:0 34px; font-size:0.85rem; "
+                            "white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"
                         ),
                     )
 
