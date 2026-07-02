@@ -113,9 +113,14 @@ def _apply_color_transfer_function(
 
     if _HAS_MATPLOTLIB and colormap in matplotlib.colormaps:
         cmap = mpl_cm.get_cmap(colormap)
-        colors = cmap(np.linspace(0.0, 1.0, 8))[:, :3]
+        # Sample the colormap densely (matches _make_lookup_table and napari,
+        # which use the full 256-entry LUT). The previous 8-point sampling made
+        # VTK linearly interpolate in RGB between widely spaced control points,
+        # which visibly distorts perceptual colormaps like viridis/turbo.
+        n = 256
+        colors = cmap(np.linspace(0.0, 1.0, n))[:, :3]
         for idx, rgb in enumerate(colors):
-            t = lo + (hi - lo) * idx / (len(colors) - 1)
+            t = lo + (hi - lo) * idx / (n - 1)
             color_tf.AddRGBPoint(float(t), float(rgb[0]), float(rgb[1]), float(rgb[2]))
     else:
         color_tf.AddRGBPoint(lo, 0.0, 0.0, 0.0)
@@ -138,11 +143,17 @@ def _apply_opacity_function(
         hi = lo + 1.0
     opacity_scale = max(0.0, min(float(opacity_scale), 4.0))
     span = hi - lo
+    # Keep the low-intensity background fully transparent and ramp opacity up
+    # steeply toward the bright end so concentrated Bragg peaks render as solid,
+    # crisp features. The previous ramp gave the low/mid range non-trivial
+    # opacity (0.02-0.12); because most RSM voxels are background, composite
+    # ray-casting accumulated that into a translucent fog that washed out the
+    # peaks (faint) and filled the volume with a diffuse haze (blurry).
     opacity_tf.AddPoint(lo, 0.0)
-    opacity_tf.AddPoint(lo + 0.05 * span, 0.02 * opacity_scale)
-    opacity_tf.AddPoint(lo + 0.25 * span, 0.12 * opacity_scale)
-    opacity_tf.AddPoint(lo + 0.75 * span, 0.35 * opacity_scale)
-    opacity_tf.AddPoint(hi, min(1.0, 0.8 * opacity_scale))
+    opacity_tf.AddPoint(lo + 0.35 * span, 0.0)
+    opacity_tf.AddPoint(lo + 0.55 * span, min(1.0, 0.08 * opacity_scale))
+    opacity_tf.AddPoint(lo + 0.80 * span, min(1.0, 0.45 * opacity_scale))
+    opacity_tf.AddPoint(hi, min(1.0, 1.0 * opacity_scale))
 
 
 def _log1p_clip(a: np.ndarray) -> np.ndarray:
@@ -821,10 +832,16 @@ def create_server():
         volume_property.SetSpecular(_float(state.specular if hasattr(state, "specular") else 0.3, 0.3))
         volume_property.SetSpecularPower(_float(state.specular_power if hasattr(state, "specular_power") else 10.0, 10.0))
         
-        # Map the napari-style rendering choice to a VTK blend mode:
-        #   mip -> maximum intensity; everything else -> composite.
+        # Map the napari-style rendering choice to a VTK blend mode. napari's
+        # default is "attenuated_mip", a maximum-intensity projection -- VTK has
+        # no attenuated-MIP mode, so MaximumIntensity is the faithful analogue.
+        # Both "mip" and "attenuated_mip" therefore use MIP; only "translucent"
+        # (or an explicit composite blend_mode) falls back to composite.
+        # Previously "attenuated_mip" fell through to composite, so the default
+        # web view used alpha-blended ray casting instead of napari's MIP, which
+        # washed the peaks out and changed their apparent shape.
         rendering = _ensure_path(getattr(state, "rendering", "")) or "attenuated_mip"
-        if rendering == "mip" or int(_float(state.blend_mode, 0)) == 1:
+        if rendering in ("mip", "attenuated_mip") or int(_float(state.blend_mode, 0)) == 1:
             volume_mapper.SetBlendModeToMaximumIntensity()
         else:
             volume_mapper.SetBlendModeToComposite()
@@ -855,8 +872,23 @@ def create_server():
         renderer.GetActiveCamera().ParallelProjectionOff()  # restore 3D perspective
         state.intensity_slider_show = False
         state.intensity_playing = False  # halt any in-progress frame playback
-        current_volume = np.asarray(volume, dtype=np.float32)
-        current_axes = axes
+
+        # Mirror napari's _ensure_ascending: flip any descending axis so the
+        # volume is stored with monotonically increasing coordinates. VTK's
+        # vtkImageData places voxel i at origin + i*spacing and assumes a
+        # positive, uniform spacing; a descending regrid axis would otherwise
+        # produce a negative spacing that mirrors the volume and corrupts the
+        # gradient normals VTK uses for shading/opacity, so parts of the RSM
+        # render faint or in the wrong place even though the overall shape is
+        # still recognizable.
+        vol = np.asarray(volume, dtype=np.float32)
+        ax_list = [np.asarray(a, dtype=float) for a in axes]
+        for _i in range(min(3, len(ax_list))):
+            if ax_list[_i].size > 1 and ax_list[_i][1] < ax_list[_i][0]:
+                ax_list[_i] = ax_list[_i][::-1].copy()
+                vol = np.flip(vol, axis=_i)
+        current_volume = np.ascontiguousarray(vol, dtype=np.float32)
+        current_axes = tuple(ax_list)
 
         # Log-compress for display so the high-dynamic-range RSM is visible,
         # and derive the transfer-function range from user-inputted contrast percentiles.
@@ -877,7 +909,7 @@ def create_server():
 
         spacings = []
         origin = []
-        for axis_values in axes:
+        for axis_values in current_axes:
             axis_arr = np.asarray(axis_values, dtype=float)
             if axis_arr.size > 1:
                 spacing = float(axis_arr[1] - axis_arr[0])
