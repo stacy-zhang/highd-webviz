@@ -28,6 +28,7 @@ from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
 from vtkmodules.vtkFiltersSources import vtkCylinderSource, vtkRegularPolygonSource, vtkSphereSource # generates a cylinder or sphere mesh (for cylindrical/spherical slicing)
 from vtkmodules.vtkRenderingCore import (
     vtkActor,
+    vtkBillboardTextActor3D,  # camera-facing text placed at a fixed 3D point
     vtkColorTransferFunction,
     vtkCoordinate,  # converts between viewport/world coordinate systems
     vtkImageSlice, 
@@ -482,6 +483,10 @@ def create_server():
     state.setdefault("slice_cmap", "turbo")
     state.setdefault("slice_show_border", True)
 
+    ## bounding box outline (rectangular prism drawn around the volume, with
+    ## (Qx, Qy, Qz) coordinate labels at each corner)
+    state.setdefault("outline_show", True)
+
     ## cylindrical slicing (Q space only)
     state.setdefault("cyl_show", False)
     state.setdefault("cyl_radius", 1.0)
@@ -613,6 +618,56 @@ def create_server():
     sph_actor = vtkActor()
     sph_actor.VisibilityOff()
     renderer.AddActor(sph_actor)
+
+    # --- Bounding box outline ---------------------------------------------
+    # A rectangular-prism wireframe around the RSM volume. Because it is a 3D
+    # actor drawn in the same (Q) world coordinates as the volume, it rotates
+    # together with the map when the camera is orbited, yet remains an
+    # independent layer that can be toggled on/off. The 8 corners are stored in
+    # a fixed index order (bit 4 -> x-axis, bit 2 -> y-axis, bit 1 -> z-axis)
+    # so both the 12 edges and the per-corner coordinate labels reference the
+    # same points.
+    outline_pts = vtkPoints()
+    outline_pts.SetNumberOfPoints(8)
+    outline_poly = vtkPolyData()
+    outline_poly.SetPoints(outline_pts)
+    _outline_edges = []
+    for _corner in range(8):
+        for _bit in (4, 2, 1):
+            _other = _corner ^ _bit
+            if _corner < _other:
+                _outline_edges.append((_corner, _other))
+    _outline_cells = vtkCellArray()
+    for _a, _b in _outline_edges:
+        _edge = vtkLine()
+        _edge.GetPointIds().SetId(0, _a)
+        _edge.GetPointIds().SetId(1, _b)
+        _outline_cells.InsertNextCell(_edge)
+    outline_poly.SetLines(_outline_cells)
+    outline_mapper = vtkPolyDataMapper()
+    outline_mapper.SetInputData(outline_poly)
+    outline_actor = vtkActor()
+    outline_actor.SetMapper(outline_mapper)
+    outline_actor.GetProperty().SetColor(0.85, 0.85, 0.9)
+    outline_actor.GetProperty().SetLineWidth(1.5)
+    outline_actor.GetProperty().LightingOff()
+    outline_actor.PickableOff()
+    outline_actor.VisibilityOff()
+    renderer.AddActor(outline_actor)
+
+    # One camera-facing text label per corner, showing that corner's
+    # (Qx, Qy, Qz) coordinate. They share the outline layer's visibility.
+    outline_label_actors = []
+    for _c in range(8):
+        _label = vtkBillboardTextActor3D()
+        _label.SetInput("")
+        _label.GetTextProperty().SetFontSize(14)
+        _label.GetTextProperty().SetColor(0.85, 0.85, 0.9)
+        _label.GetTextProperty().SetJustificationToCentered()
+        _label.PickableOff()
+        _label.VisibilityOff()
+        renderer.AddActor(_label)
+        outline_label_actors.append(_label)
 
     # --- Intensity frame viewer: a single 2D image slice scrubbed by the
     # bottom slider (View Intensity). Hidden until the user enables it.
@@ -1056,8 +1111,41 @@ def create_server():
             _float(state.sph_opacity, 0.7), show,
         )
 
+    def _update_outline_box():
+        """Draw a bounding-box wireframe around the volume with corner labels.
+
+        The 8 corners are the min/max coordinate of each axis (Qx, Qy, Qz),
+        taken from ``current_image``'s bounds. Corner ``c`` uses bit 4 for the
+        x extreme, bit 2 for y and bit 1 for z (0 = min, 1 = max), matching the
+        edge topology built at actor-creation time. Each corner also carries a
+        billboard label showing its (Qx, Qy, Qz) coordinate.
+        """
+        show = bool(getattr(state, "outline_show", True))
+        if current_image is None or not show:
+            outline_actor.VisibilityOff()
+            for label in outline_label_actors:
+                label.VisibilityOff()
+            return
+
+        bounds = current_image.GetBounds()  # (xlo, xhi, ylo, yhi, zlo, zhi)
+        xs = (bounds[0], bounds[1])
+        ys = (bounds[2], bounds[3])
+        zs = (bounds[4], bounds[5])
+        for c in range(8):
+            x = xs[1 if c & 4 else 0]
+            y = ys[1 if c & 2 else 0]
+            z = zs[1 if c & 1 else 0]
+            outline_pts.SetPoint(c, x, y, z)
+            label = outline_label_actors[c]
+            label.SetInput(f"({x:.3g}, {y:.3g}, {z:.3g})")
+            label.SetPosition(x, y, z)
+            label.VisibilityOn()
+        outline_pts.Modified()
+        outline_actor.VisibilityOn()
+
     def _update_all_slices():
         try:
+            _update_outline_box()
             for axis in ("x", "y", "z"):
                 _update_ortho_slice(axis)
             _update_cylinder()
@@ -2400,6 +2488,7 @@ def create_server():
     def _layer_prop(key):
         return {
             "volume": volume_actor,
+            "outline": outline_actor,
             "intensity_map": intensity_actor,
             "roi": roi_outline_actor,
             "cross": cross_actor,
@@ -2425,7 +2514,7 @@ def create_server():
         """List the layers present in the 3D volume view (volume + active slices)."""
         if bool(getattr(state, "intensity_slider_show", False)):
             return  # the intensity view manages its own layer list
-        items = [("volume", "RSM Volume")]
+        items = [("volume", "RSM Volume"), ("outline", "Bounding Box")]
         for ax, lbl in (("x", "Slice X"), ("y", "Slice Y"), ("z", "Slice Z")):
             if slice_actors[ax].GetVisibility():
                 items.append((f"slice_{ax}", lbl))
@@ -2453,6 +2542,9 @@ def create_server():
         visible = bool(visible)
         if key == "volume":
             volume_actor.SetVisibility(1 if visible else 0)
+        elif key == "outline":
+            state.outline_show = visible
+            _update_outline_box()
         elif key == "intensity_map":
             intensity_actor.SetVisibility(1 if visible else 0)
         elif key == "roi":
