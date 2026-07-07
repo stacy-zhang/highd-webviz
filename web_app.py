@@ -703,15 +703,15 @@ def create_server():
         outline_label_actors.append(_label)
 
     # --- World axes -------------------------------------------------------
-    # Three colored direction arrows rooted at the volume's origin corner
-    # (the min of each axis), pointing along +Qx (magenta), +Qy (green) and
-    # +Qz (cyan). This mirrors napari's "World axes" overlay: a purely visual
-    # orientation reference that rotates together with the map. It does NOT
-    # change the coordinate values reported at the outline-box corners -- it
+    # Three colored direction arrows rooted at the reciprocal-space origin,
+    # pointing along +Qx (cyan), +Qy (magenta) and +Qz (yellow) -- the same
+    # colors napari uses. This mirrors napari's "World axes" overlay: a purely
+    # visual orientation reference that rotates together with the map. It does
+    # NOT change the coordinate values reported at the outline-box corners -- it
     # only shows which way the +Qx/+Qy/+Qz (or +H/+K/+L) axes point. Each axis
     # is a thin line shaft plus a cone arrowhead and a tip label; all nine
     # actors share a single "World Axes" layer toggle.
-    _world_axis_colors = ((1.0, 0.2, 1.0), (0.4, 1.0, 0.2), (0.2, 0.9, 1.0))
+    _world_axis_colors = ((0.0, 1.0, 1.0), (1.0, 0.0, 1.0), (1.0, 1.0, 0.0))
     world_axes_line_sources = []
     world_axes_cone_sources = []
     world_axes_actors = []
@@ -720,7 +720,14 @@ def create_server():
     # _update_world_axes (sets it when the volume changes) and
     # _rescale_world_axes (re-sizes it every render so it stays a constant
     # on-screen size regardless of zoom). Target shaft length is in pixels.
-    world_axes_geom = {"origin": None, "visible": False, "target_px": 90.0}
+    # ``signs`` mirrors an axis direction to match napari's handedness (the z
+    # world axis is flipped so +Qz points up).
+    world_axes_geom = {
+        "origin": None,
+        "visible": False,
+        "target_px": 90.0,
+        "signs": (1.0, 1.0, -1.0),
+    }
     for _i in range(3):
         _col = _world_axis_colors[_i]
         _ls = vtkLineSource()
@@ -1057,20 +1064,34 @@ def create_server():
 
         spacings = []
         origin = []
-        for axis_values in current_axes:
+        for _ai, axis_values in enumerate(current_axes):
             axis_arr = np.asarray(axis_values, dtype=float)
             if axis_arr.size > 1:
                 spacing = float(axis_arr[1] - axis_arr[0])
             else:
                 spacing = 1.0
-            spacings.append(spacing)
-            origin.append(float(axis_arr[0]))
+            if _ai == 2:
+                # Display the reciprocal-space frame with napari's handedness so
+                # +Qz points up (VTK is right-handed and would otherwise render
+                # +Qz downward when +Qx is right and +Qy is out of the page).
+                # Mirror the z world axis: true Qz value v renders at world
+                # z = -v (spacing stays positive; origin = -zax[-1]). The raw
+                # ``current_volume`` and ``current_axes`` keep the true Qz, so
+                # export and the corner-coordinate labels are unaffected.
+                spacings.append(spacing)
+                origin.append(-float(axis_arr[-1]))
+            else:
+                spacings.append(spacing)
+                origin.append(float(axis_arr[0]))
 
         image.SetSpacing(*spacings)
         image.SetOrigin(*origin)
 
+        # Reverse the volume along z so the mirrored origin above still places
+        # each voxel at world z = -(its true Qz).
+        display_for_vtk = display_volume[:, :, ::-1]
         vtk_array = numpy_support.numpy_to_vtk(
-            np.ascontiguousarray(display_volume, dtype=np.float32).ravel(order="F"),
+            np.ascontiguousarray(display_for_vtk, dtype=np.float32).ravel(order="F"),
             deep=True,
             array_type=numpy_support.get_vtk_array_type(np.float32),
         )
@@ -1243,10 +1264,14 @@ def create_server():
             x = xs[1 if c & 4 else 0]
             y = ys[1 if c & 2 else 0]
             z = zs[1 if c & 1 else 0]
-            outline_pts.SetPoint(c, x, y, z)
+            # The z world axis is mirrored (see _set_volume_data) so +Qz points
+            # up like napari; place the corner at world z = -z but keep the true
+            # Qz value in the label text.
+            wz = -z
+            outline_pts.SetPoint(c, x, y, wz)
             label = outline_label_actors[c]
             label.SetInput(f"{n0}={x:.3f}, {n1}={y:.3f}, {n2}={z:.3f}")
-            label.SetPosition(x, y, z)
+            label.SetPosition(x, y, wz)
             label.VisibilityOn()
         outline_pts.Modified()
         outline_actor.VisibilityOn()
@@ -1292,8 +1317,12 @@ def create_server():
 
         ox = _clamp(0.0, ax_x)
         oy = _clamp(0.0, ax_y)
-        oz = _clamp(0.0, ax_z)
-        world_axes_geom["origin"] = (ox, oy, oz)
+        oz_true = _clamp(0.0, ax_z)
+        # The z world axis is mirrored (see _set_volume_data) so +Qz points up
+        # like napari: root the gizmo at world z = -oz_true and make the +Qz
+        # arrow point along world -z (via world_axes_geom["signs"]).
+        world_axes_geom["origin"] = (ox, oy, -oz_true)
+        world_axes_geom["signs"] = (1.0, 1.0, -1.0)
         world_axes_geom["visible"] = True
 
         is_q = (_ensure_path(getattr(state, "space", "q")) or "q").lower() == "q"
@@ -1356,11 +1385,18 @@ def create_server():
         if not np.isfinite(length) or length <= 0.0:
             return
 
-        dirs = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        # Per-axis direction signs mirror an axis to match napari's handedness
+        # (the z world axis is flipped so +Qz points up).
+        signs = world_axes_geom.get("signs", (1.0, 1.0, 1.0))
+        dirs = (
+            (signs[0], 0.0, 0.0),
+            (0.0, signs[1], 0.0),
+            (0.0, 0.0, signs[2]),
+        )
         tips = (
-            (ox + length, oy, oz),
-            (ox, oy + length, oz),
-            (ox, oy, oz + length),
+            (ox + signs[0] * length, oy, oz),
+            (ox, oy + signs[1] * length, oz),
+            (ox, oy, oz + signs[2] * length),
         )
         for i in range(3):
             src = world_axes_line_sources[i]
