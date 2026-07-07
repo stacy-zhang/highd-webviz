@@ -25,7 +25,7 @@ from vtkmodules.vtkCommonDataModel import (
 from vtkmodules.vtkCommonTransforms import vtkTransform
 from vtkmodules.vtkFiltersCore import vtkGlyph3D, vtkProbeFilter
 from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
-from vtkmodules.vtkFiltersSources import vtkCylinderSource, vtkRegularPolygonSource, vtkSphereSource # generates a cylinder or sphere mesh (for cylindrical/spherical slicing)
+from vtkmodules.vtkFiltersSources import vtkConeSource, vtkCylinderSource, vtkLineSource, vtkRegularPolygonSource, vtkSphereSource # cylinder/sphere meshes for slicing; line + cone build the world-axes arrows
 from vtkmodules.vtkRenderingCore import (
     vtkActor,
     vtkBillboardTextActor3D,  # camera-facing text placed at a fixed 3D point
@@ -513,6 +513,10 @@ def create_server():
     ## (Qx, Qy, Qz) coordinate labels at each corner)
     state.setdefault("outline_show", True)
 
+    ## world axes overlay (colored +Qx/+Qy/+Qz direction arrows rooted at the
+    ## volume's origin corner -- a visual orientation guide, mirrors napari)
+    state.setdefault("world_axes_show", True)
+
     ## cylindrical slicing (Q space only)
     state.setdefault("cyl_show", False)
     state.setdefault("cyl_radius", 1.0)
@@ -697,6 +701,61 @@ def create_server():
         _label.VisibilityOff()
         renderer.AddActor(_label)
         outline_label_actors.append(_label)
+
+    # --- World axes -------------------------------------------------------
+    # Three colored direction arrows rooted at the volume's origin corner
+    # (the min of each axis), pointing along +Qx (magenta), +Qy (green) and
+    # +Qz (cyan). This mirrors napari's "World axes" overlay: a purely visual
+    # orientation reference that rotates together with the map. It does NOT
+    # change the coordinate values reported at the outline-box corners -- it
+    # only shows which way the +Qx/+Qy/+Qz (or +H/+K/+L) axes point. Each axis
+    # is a thin line shaft plus a cone arrowhead and a tip label; all nine
+    # actors share a single "World Axes" layer toggle.
+    _world_axis_colors = ((1.0, 0.2, 1.0), (0.4, 1.0, 0.2), (0.2, 0.9, 1.0))
+    world_axes_line_sources = []
+    world_axes_cone_sources = []
+    world_axes_actors = []
+    world_axes_labels = []
+    for _i in range(3):
+        _col = _world_axis_colors[_i]
+        _ls = vtkLineSource()
+        _lm = vtkPolyDataMapper()
+        _lm.SetInputConnection(_ls.GetOutputPort())
+        _la = vtkActor()
+        _la.SetMapper(_lm)
+        _la.GetProperty().SetColor(*_col)
+        _la.GetProperty().SetLineWidth(3.0)
+        _la.GetProperty().LightingOff()
+        _la.PickableOff()
+        _la.VisibilityOff()
+        renderer.AddActor(_la)
+
+        _cs = vtkConeSource()
+        _cs.SetResolution(16)
+        _cm = vtkPolyDataMapper()
+        _cm.SetInputConnection(_cs.GetOutputPort())
+        _ca = vtkActor()
+        _ca.SetMapper(_cm)
+        _ca.GetProperty().SetColor(*_col)
+        _ca.GetProperty().LightingOff()
+        _ca.PickableOff()
+        _ca.VisibilityOff()
+        renderer.AddActor(_ca)
+
+        _wlbl = vtkBillboardTextActor3D()
+        _wlbl.SetInput("")
+        _wlbl.GetTextProperty().SetFontSize(14)
+        _wlbl.GetTextProperty().SetColor(*_col)
+        _wlbl.GetTextProperty().SetJustificationToCentered()
+        _wlbl.PickableOff()
+        _wlbl.VisibilityOff()
+        renderer.AddActor(_wlbl)
+
+        world_axes_line_sources.append(_ls)
+        world_axes_cone_sources.append(_cs)
+        world_axes_actors.append(_la)
+        world_axes_actors.append(_ca)
+        world_axes_labels.append(_wlbl)
 
     # --- Intensity frame viewer: a single 2D image slice scrubbed by the
     # bottom slider (View Intensity). Hidden until the user enables it.
@@ -1143,38 +1202,108 @@ def create_server():
     def _update_outline_box():
         """Draw a bounding-box wireframe around the volume with corner labels.
 
-        The 8 corners are the min/max coordinate of each axis (Qx, Qy, Qz),
-        taken from ``current_image``'s bounds. Corner ``c`` uses bit 4 for the
-        x extreme, bit 2 for y and bit 1 for z (0 = min, 1 = max), matching the
-        edge topology built at actor-creation time. Each corner also carries a
-        billboard label showing its (Qx, Qy, Qz) coordinate.
+        The 8 corners are the min/max coordinate of each axis, read directly
+        from ``current_axes`` (the regrid bin-center arrays). Using the axis
+        endpoints -- rather than deriving the max from VTK image bounds
+        (origin + spacing*(dim-1)) -- makes the labels match the napari desktop
+        app exactly, which reports ``xax[0]``/``xax[-1]`` and friends. Corner
+        ``c`` uses bit 4 for the x extreme, bit 2 for y and bit 1 for z
+        (0 = min, 1 = max), matching the edge topology built at actor-creation
+        time. Labels are formatted like napari (``Qx=..`` / ``H=..`` with 3
+        decimals) so the two front-ends read identically.
         """
         show = bool(getattr(state, "outline_show", True))
-        if current_image is None or not show:
+        if current_image is None or current_axes is None or not show:
             outline_actor.VisibilityOff()
             for label in outline_label_actors:
                 label.VisibilityOff()
             return
 
-        bounds = current_image.GetBounds()  # (xlo, xhi, ylo, yhi, zlo, zhi)
-        xs = (bounds[0], bounds[1])
-        ys = (bounds[2], bounds[3])
-        zs = (bounds[4], bounds[5])
+        # Axis endpoints (min, max) straight from the regrid axes, matching the
+        # values napari displays at the box corners.
+        ax_x = np.asarray(current_axes[0], dtype=float)
+        ax_y = np.asarray(current_axes[1], dtype=float)
+        ax_z = np.asarray(current_axes[2], dtype=float)
+        xs = (float(ax_x[0]), float(ax_x[-1]))
+        ys = (float(ax_y[0]), float(ax_y[-1]))
+        zs = (float(ax_z[0]), float(ax_z[-1]))
+
+        # Match napari's per-space corner label (Qx/Qy/Qz for reciprocal space,
+        # H/K/L for crystallographic space) so the coordinate readout is
+        # identical across the desktop and web viewers.
+        is_q = (_ensure_path(getattr(state, "space", "q")) or "q").lower() == "q"
+        n0, n1, n2 = ("Qx", "Qy", "Qz") if is_q else ("H", "K", "L")
+
         for c in range(8):
             x = xs[1 if c & 4 else 0]
             y = ys[1 if c & 2 else 0]
             z = zs[1 if c & 1 else 0]
             outline_pts.SetPoint(c, x, y, z)
             label = outline_label_actors[c]
-            label.SetInput(f"({x:.3g}, {y:.3g}, {z:.3g})")
+            label.SetInput(f"{n0}={x:.3f}, {n1}={y:.3f}, {n2}={z:.3f}")
             label.SetPosition(x, y, z)
             label.VisibilityOn()
         outline_pts.Modified()
         outline_actor.VisibilityOn()
 
+    def _update_world_axes():
+        """Draw +Qx/+Qy/+Qz direction arrows from the volume's origin corner.
+
+        Mirrors napari's "World axes" overlay. The arrows are rooted at the
+        (min, min, min) corner -- ``(xax[0], yax[0], zax[0])`` -- and each is
+        drawn 10% of the largest axis extent long, pointing toward increasing
+        Qx (magenta), Qy (green) and Qz (cyan). This is a visual orientation
+        cue only; it does not alter the coordinate values shown elsewhere.
+        Labels switch to +H/+K/+L in crystallographic space to match the
+        outline-box corner labels.
+        """
+        show = bool(getattr(state, "world_axes_show", True))
+        if current_image is None or current_axes is None or not show:
+            for actor in world_axes_actors:
+                actor.VisibilityOff()
+            for label in world_axes_labels:
+                label.VisibilityOff()
+            return
+
+        ax_x = np.asarray(current_axes[0], dtype=float)
+        ax_y = np.asarray(current_axes[1], dtype=float)
+        ax_z = np.asarray(current_axes[2], dtype=float)
+        ox, oy, oz = float(ax_x[0]), float(ax_y[0]), float(ax_z[0])
+        lx = float(ax_x[-1]) - ox
+        ly = float(ax_y[-1]) - oy
+        lz = float(ax_z[-1]) - oz
+        length = 0.10 * (max(abs(lx), abs(ly), abs(lz)) or 1.0)
+
+        is_q = (_ensure_path(getattr(state, "space", "q")) or "q").lower() == "q"
+        names = ("+Qx", "+Qy", "+Qz") if is_q else ("+H", "+K", "+L")
+        tips = (
+            (ox + length, oy, oz),
+            (ox, oy + length, oz),
+            (ox, oy, oz + length),
+        )
+        dirs = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        for i in range(3):
+            src = world_axes_line_sources[i]
+            src.SetPoint1(ox, oy, oz)
+            src.SetPoint2(*tips[i])
+            src.Modified()
+            cone = world_axes_cone_sources[i]
+            cone.SetCenter(*tips[i])
+            cone.SetDirection(*dirs[i])
+            cone.SetHeight(0.28 * length)
+            cone.SetRadius(0.09 * length)
+            cone.Modified()
+            label = world_axes_labels[i]
+            label.SetInput(names[i])
+            label.SetPosition(*tips[i])
+            label.VisibilityOn()
+        for actor in world_axes_actors:
+            actor.VisibilityOn()
+
     def _update_all_slices():
         try:
             _update_outline_box()
+            _update_world_axes()
             for axis in ("x", "y", "z"):
                 _update_ortho_slice(axis)
             _update_cylinder()
@@ -2518,6 +2647,7 @@ def create_server():
         return {
             "volume": volume_actor,
             "outline": outline_actor,
+            "world_axes": world_axes_actors[0] if world_axes_actors else None,
             "intensity_map": intensity_actor,
             "roi": roi_outline_actor,
             "cross": cross_actor,
@@ -2543,7 +2673,7 @@ def create_server():
         """List the layers present in the 3D volume view (volume + active slices)."""
         if bool(getattr(state, "intensity_slider_show", False)):
             return  # the intensity view manages its own layer list
-        items = [("volume", "RSM Volume"), ("outline", "Outline Box")]
+        items = [("volume", "RSM Volume"), ("outline", "Outline Box"), ("world_axes", "World Axes")]
         for ax, lbl in (("x", "Slice X"), ("y", "Slice Y"), ("z", "Slice Z")):
             if slice_actors[ax].GetVisibility():
                 items.append((f"slice_{ax}", lbl))
@@ -2574,6 +2704,9 @@ def create_server():
         elif key == "outline":
             state.outline_show = visible
             _update_outline_box()
+        elif key == "world_axes":
+            state.world_axes_show = visible
+            _update_world_axes()
         elif key == "intensity_map":
             intensity_actor.SetVisibility(1 if visible else 0)
         elif key == "roi":
