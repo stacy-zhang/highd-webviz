@@ -592,9 +592,21 @@ def create_server():
 
     renderer = vtkRenderer()
     renderer.SetBackground(0.10, 0.10, 0.12)
+    renderer.SetLayer(0)
+
+    # Overlay renderer for the world-axes gizmo. It sits on a higher layer and
+    # shares the main camera, so it rotates/zooms in lockstep with the volume
+    # but renders with its own (freshly cleared) depth buffer. That makes the
+    # axes always draw on top of the volume instead of being occluded by it.
+    overlay_renderer = vtkRenderer()
+    overlay_renderer.SetLayer(1)
+    overlay_renderer.SetActiveCamera(renderer.GetActiveCamera())
+    overlay_renderer.InteractiveOff()
 
     render_window = vtkRenderWindow()
+    render_window.SetNumberOfLayers(2)
     render_window.AddRenderer(renderer)
+    render_window.AddRenderer(overlay_renderer)
     render_window.SetSize(1024, 768)
     render_window.SetOffScreenRendering(1)
 
@@ -740,7 +752,7 @@ def create_server():
         _la.GetProperty().LightingOff()
         _la.PickableOff()
         _la.VisibilityOff()
-        renderer.AddActor(_la)
+        overlay_renderer.AddActor(_la)
 
         _cs = vtkConeSource()
         _cs.SetResolution(16)
@@ -752,7 +764,7 @@ def create_server():
         _ca.GetProperty().LightingOff()
         _ca.PickableOff()
         _ca.VisibilityOff()
-        renderer.AddActor(_ca)
+        overlay_renderer.AddActor(_ca)
 
         _wlbl = vtkBillboardTextActor3D()
         _wlbl.SetInput("")
@@ -761,7 +773,7 @@ def create_server():
         _wlbl.GetTextProperty().SetJustificationToCentered()
         _wlbl.PickableOff()
         _wlbl.VisibilityOff()
-        renderer.AddActor(_wlbl)
+        overlay_renderer.AddActor(_wlbl)
 
         world_axes_line_sources.append(_ls)
         world_axes_cone_sources.append(_cs)
