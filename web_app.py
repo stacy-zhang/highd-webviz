@@ -85,6 +85,32 @@ COLORMAP_NAMES = [
     "gray",
 ]
 
+# Layer-panel eye toggle glyphs, rendered as inline SVG via Vue's v-html (see
+# the layer panel). Using inline SVG instead of a CSS url() data URI avoids the
+# percent-encoding pitfalls that left the icon invisible, and needs no icon font
+# or Vuetify component. These are the Material Design Icons "eye" / "eye-off"
+# paths on a 24x24 viewBox.
+_EYE_ON_SVG = (
+    "<svg viewBox='0 0 24 24' width='20' height='20' style='display:block;'>"
+    "<path fill='#dcdce0' d='M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 "
+    "15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 "
+    "0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 "
+    "21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z'/></svg>"
+)
+_EYE_OFF_SVG = (
+    "<svg viewBox='0 0 24 24' width='20' height='20' style='display:block;'>"
+    "<path fill='#808088' d='M11.83,9L15,12.16C15,12.11 15,12.05 15,12A3,3 0 0,0 "
+    "12,9C11.94,9 11.89,9 11.83,9M7.53,9.8L9.08,11.35C9.03,11.56 9,11.77 9,12A3,3 "
+    "0 0,0 12,15C12.22,15 12.44,14.97 12.65,14.92L14.2,16.47C13.53,16.8 12.79,17 "
+    "12,17A5,5 0 0,1 7,12C7,11.21 7.2,10.47 7.53,9.8M2,4.27L4.28,6.55L4.73,7C3.08,"
+    "8.3 1.78,10 1,12C2.73,16.39 7,19.5 12,19.5C13.55,19.5 15.03,19.2 "
+    "16.38,18.66L16.81,19.09L19.73,22L21,20.73L3.27,3M12,7A5,5 0 0,1 17,12C17,12.64 "
+    "16.87,13.26 16.64,13.82L19.57,16.75C21.07,15.5 22.27,13.86 23,12C21.27,7.61 "
+    "17,4.5 12,4.5C10.6,4.5 9.26,4.75 8,5.2L10.17,7.35C10.74,7.13 11.35,7 12,7Z'/>"
+    "</svg>"
+)
+
+
 
 def _float(value: Optional[object], default: float) -> float:
     try:
@@ -543,6 +569,9 @@ def create_server():
     # active view. Each entry is {"key", "name", "visible"} and drives one row
     # (name + eye toggle) in the panel. Rebuilt whenever the active view changes.
     state.setdefault("layers", [])
+    # Inline SVG markup for the layer visibility toggle, injected via v-html.
+    state.setdefault("eye_on_svg", _EYE_ON_SVG)
+    state.setdefault("eye_off_svg", _EYE_OFF_SVG)
 
     # Progress bar shown at the top of the viewer during long-running pipeline
     # steps (load / build / regrid / export). ``progress_active`` toggles the
@@ -2514,7 +2543,7 @@ def create_server():
         """List the layers present in the 3D volume view (volume + active slices)."""
         if bool(getattr(state, "intensity_slider_show", False)):
             return  # the intensity view manages its own layer list
-        items = [("volume", "RSM Volume"), ("outline", "Bounding Box")]
+        items = [("volume", "RSM Volume"), ("outline", "Outline Box")]
         for ax, lbl in (("x", "Slice X"), ("y", "Slice Y"), ("z", "Slice Z")):
             if slice_actors[ax].GetVisibility():
                 items.append((f"slice_{ax}", lbl))
@@ -2751,23 +2780,6 @@ def create_server():
             "border: 1px solid #44444a; border-radius: 2px; }"
             "input.frame-slider::-moz-range-thumb { width: 16px; height: 20px; border: none; "
             "background: #6aa9ff; border: 1px solid #cfe2ff; border-radius: 2px; }"
-            # Layer-panel eye toggle icons (open eye / slashed eye).
-            ".layer-eye { width: 20px; height: 20px; display: inline-block; "
-            "background-repeat: no-repeat; background-position: center; "
-            "background-size: 18px 18px; }"
-            ".layer-eye-on { background-image: url(\"data:image/svg+xml,"
-            "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' "
-            "fill='none' stroke='%23dcdce0' stroke-width='2' stroke-linecap='round' "
-            "stroke-linejoin='round'><path d='M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z'/>"
-            "<circle cx='12' cy='12' r='3'/></svg>\"); }"
-            ".layer-eye-off { opacity: 0.6; background-image: url(\"data:image/svg+xml,"
-            "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' "
-            "fill='none' stroke='%23808088' stroke-width='2' stroke-linecap='round' "
-            "stroke-linejoin='round'>"
-            "<path d='M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94'/>"
-            "<path d='M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19'/>"
-            "<path d='M14.12 14.12a3 3 0 1 1-4.24-4.24'/>"
-            "<line x1='1' y1='1' x2='23' y2='23'/></svg>\"); }"
             # Animated barber-pole stripes for the top-of-viewer progress bar so
             # the fill visibly \"moves\" while a job runs.
             "@keyframes progress-stripes { from { background-position: 0 0; } "
@@ -3274,17 +3286,20 @@ def create_server():
                         "border-radius:6px; user-select:none;"
                     ),
                 ):
-                    with html.Button(
+                    # Eye toggle: an inline SVG eye / eye-off glyph (injected
+                    # via v-html) whose shape tracks the layer's visibility.
+                    # Clicking it flips the layer via the toggle_layer
+                    # controller (which updates the VTK actor and pushes a fresh
+                    # frame to the remote view).
+                    html.Div(
+                        v_html="layer.visible ? eye_on_svg : eye_off_svg",
                         click=(ctrl.toggle_layer, "[layer.key]"),
                         title="Show / hide this layer",
                         style=(
                             "position:relative; z-index:2; display:flex; align-items:center; "
-                            "justify-content:center; width:24px; height:24px; padding:0; margin:0; "
-                            "background:none; border:none; cursor:pointer;"
+                            "justify-content:center; width:24px; height:24px; cursor:pointer;"
                         ),
-                    ):
-                        html.Span(classes="layer-eye layer-eye-on", v_show="layer.visible")
-                        html.Span(classes="layer-eye layer-eye-off", v_show="!layer.visible")
+                    )
                     html.Span(
                         "{{ layer.name }}",
                         style=(
