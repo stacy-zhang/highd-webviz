@@ -1247,10 +1247,11 @@ def create_server():
         outline_actor.VisibilityOn()
 
     def _update_world_axes():
-        """Draw +Qx/+Qy/+Qz direction arrows from the volume's origin corner.
+        """Draw +Qx/+Qy/+Qz direction arrows from the reciprocal-space origin.
 
         Mirrors napari's "World axes" overlay. The arrows are rooted at the
-        (min, min, min) corner -- ``(xax[0], yax[0], zax[0])`` -- and each is
+        origin ``(0, 0, 0)`` -- clamped into the data bounds so the gizmo stays
+        on-screen if the origin lies outside the regridded volume -- and each is
         drawn 10% of the largest axis extent long, pointing toward increasing
         Qx (magenta), Qy (green) and Qz (cyan). This is a visual orientation
         cue only; it does not alter the coordinate values shown elsewhere.
@@ -1268,11 +1269,23 @@ def create_server():
         ax_x = np.asarray(current_axes[0], dtype=float)
         ax_y = np.asarray(current_axes[1], dtype=float)
         ax_z = np.asarray(current_axes[2], dtype=float)
-        ox, oy, oz = float(ax_x[0]), float(ax_y[0]), float(ax_z[0])
-        lx = float(ax_x[-1]) - ox
-        ly = float(ax_y[-1]) - oy
-        lz = float(ax_z[-1]) - oz
+        lx = float(ax_x[-1]) - float(ax_x[0])
+        ly = float(ax_y[-1]) - float(ax_y[0])
+        lz = float(ax_z[-1]) - float(ax_z[0])
         length = 0.10 * (max(abs(lx), abs(ly), abs(lz)) or 1.0)
+
+        # Root the arrows at the reciprocal-space origin (0, 0, 0). If the
+        # origin falls outside the regridded extents, clamp each component into
+        # the data bounds so the gizmo remains visible next to the volume.
+        def _clamp(value, axis):
+            lo, hi = float(axis[0]), float(axis[-1])
+            if lo > hi:
+                lo, hi = hi, lo
+            return min(max(value, lo), hi)
+
+        ox = _clamp(0.0, ax_x)
+        oy = _clamp(0.0, ax_y)
+        oz = _clamp(0.0, ax_z)
 
         is_q = (_ensure_path(getattr(state, "space", "q")) or "q").lower() == "q"
         names = ("+Qx", "+Qy", "+Qz") if is_q else ("+H", "+K", "+L")
