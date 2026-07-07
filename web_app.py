@@ -52,7 +52,7 @@ from trame.ui.html import DivLayout
 from trame.widgets import html
 from trame.widgets.vtk import VtkRemoteView
 
-PACKAGE_NAME = "napari_resview"
+PACKAGE_NAME = "src"
 PACKAGE_PATH = Path(__file__).resolve().parent / PACKAGE_NAME
 
 if PACKAGE_NAME not in sys.modules:
@@ -60,8 +60,8 @@ if PACKAGE_NAME not in sys.modules:
     package_module.__path__ = [str(PACKAGE_PATH)]
     sys.modules[PACKAGE_NAME] = package_module
 
-_data_io = importlib.import_module("napari_resview.data_io")
-_rsm3d = importlib.import_module("napari_resview.rsm3d")
+_data_io = importlib.import_module("src.data_io")
+_rsm3d = importlib.import_module("src.rsm3d")
 
 RSMDataLoader_ISR = _data_io.RSMDataLoader_ISR
 RSMDataloader_CMS = _data_io.RSMDataloader_CMS
@@ -417,7 +417,7 @@ def _parse_grid_shape(
 
 # partly copied from resview_widget.py
 DEFAULTS_ENV = "RSM3D_DEFAULTS_YAML"
-# The bundled defaults YAML lives inside the napari_resview package, not next to
+# The bundled defaults YAML lives inside the src package, not next to
 # web_app.py. Use PACKAGE_PATH so the auto-filled setup path points at the file
 # that actually exists (web_app.py sits one directory above the package, so
 # Path(__file__).with_name(...) would resolve to a non-existent root-level file).
@@ -433,7 +433,7 @@ def yaml_path() -> str: # Allow override of defaults path via environment variab
     return os.path.join(os.path.expanduser("~"), ".rsm3d_defaults.yaml")
 
 def create_server():
-    server = get_server(name="napari_resview_web", client_type="vue3")
+    server = get_server(name="voxel_web", client_type="vue3")
     state, ctrl = server.state, server.controller
 
     # Data tab
@@ -3029,7 +3029,7 @@ def create_server():
                 ),
             )
             with html.Div():
-                html.H2("Napari ResView Web", style="margin:0; font-size:1.3rem;")
+                html.H2("Voxel", style="margin:0; font-size:1.3rem;")
                 html.P(
                     "Load experiment profiles, build 3D RSM volumes, and inspect results in the browser.",
                     style="margin:0; font-size:0.9rem; color:#666;",
