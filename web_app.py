@@ -2987,6 +2987,33 @@ def create_server():
             state.exp_energy = 12.398419843320026 / wavelength
             _ew_sync["busy"] = False
 
+    # Live-update the volume rendering when the contrast percentiles change.
+    # Only the transfer-function range depends on contrast_lo/hi (the scalar
+    # data fed to VTK is unchanged), so we just recompute render_range from the
+    # current display volume and re-apply the color/opacity functions -- far
+    # cheaper than rebuilding the vtkImageData via refresh_rendering. An
+    # out-of-order value while the user is mid-edit (lo >= hi) is ignored rather
+    # than snapped back to defaults.
+    @state.change("contrast_lo", "contrast_hi")
+    def _on_contrast_change(**kwargs):
+        nonlocal render_range
+        if current_volume is None:
+            return
+        lo = _float(getattr(state, "contrast_lo", 1.0), 1.0)
+        hi = _float(getattr(state, "contrast_hi", 99.8), 99.8)
+        if not (0.0 <= lo < hi <= 100.0):
+            return
+        if bool(getattr(state, "log_view", True)):
+            display_volume = _log1p_clip(current_volume)
+        else:
+            display_volume = np.maximum(current_volume, 0.0)
+        render_range = _robust_percentiles(display_volume, (lo, hi))
+        _update_rendering()
+        _update_all_slices()
+        render_window.Render()
+        if remote_view is not None:
+            remote_view.update()
+
     # Clamp the CMS angle step to the valid [0, 360] range. Corrects a typed out-of-range value.
     @state.change("cms_angle_step")
     def _on_cms_angle_step_change(cms_angle_step=None, **kwargs):
