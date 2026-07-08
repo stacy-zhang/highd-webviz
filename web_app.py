@@ -2992,8 +2992,7 @@ def create_server():
     # data fed to VTK is unchanged), so we just recompute render_range from the
     # current display volume and re-apply the color/opacity functions -- far
     # cheaper than rebuilding the vtkImageData via refresh_rendering. An
-    # out-of-order value while the user is mid-edit (lo >= hi) is ignored rather
-    # than snapped back to defaults.
+    # out-of-order value while the user is mid-edit (lo >= hi) is ignored.
     @state.change("contrast_lo", "contrast_hi")
     def _on_contrast_change(**kwargs):
         nonlocal render_range
@@ -3067,6 +3066,28 @@ def create_server():
             "border: 1px solid #44444a; border-radius: 2px; }"
             "input.frame-slider::-moz-range-thumb { width: 16px; height: 20px; border: none; "
             "background: #6aa9ff; border: 1px solid #cfe2ff; border-radius: 2px; }"
+            # Dual-range \"Contrast Limits\" slider (right panel): two range
+            # inputs stacked over a shared track, each carrying one thumb. The
+            # inputs are transparent and pointer-events:none except on the
+            # thumbs, so both handles stay independently draggable; a colored
+            # fill div marks the selected [low, high] span between them.
+            ".dual-slider { position: relative; height: 28px; margin: 4px 0 2px; }"
+            ".dual-slider .track { position: absolute; top: 12px; left: 0; right: 0; "
+            "height: 4px; background: #44444a; border-radius: 2px; }"
+            ".dual-slider .fill { position: absolute; top: 12px; height: 4px; "
+            "background: #6aa9ff; border-radius: 2px; }"
+            ".dual-slider input[type=range] { -webkit-appearance: none; appearance: none; "
+            "position: absolute; top: 0; left: 0; width: 100%; height: 28px; margin: 0; "
+            "background: none; pointer-events: none; }"
+            ".dual-slider input[type=range]::-webkit-slider-runnable-track { height: 4px; "
+            "background: transparent; }"
+            ".dual-slider input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; "
+            "appearance: none; width: 16px; height: 16px; margin-top: -6px; border-radius: 50%; "
+            "background: #6aa9ff; border: 1px solid #cfe2ff; cursor: pointer; pointer-events: auto; }"
+            ".dual-slider input[type=range]::-moz-range-track { height: 4px; background: transparent; }"
+            ".dual-slider input[type=range]::-moz-range-thumb { width: 16px; height: 16px; "
+            "border-radius: 50%; background: #6aa9ff; border: 1px solid #cfe2ff; "
+            "cursor: pointer; pointer-events: auto; }"
             # Animated barber-pole stripes for the top-of-viewer progress bar so
             # the fill visibly \"moves\" while a job runs.
             "@keyframes progress-stripes { from { background-position: 0 0; } "
@@ -3559,6 +3580,47 @@ def create_server():
                     "font-family:sans-serif;"
                 ),
             ):
+                # Contrast Limits dual-range slider. Bound to the same
+                # contrast_lo / contrast_hi state as the View-tab input boxes,
+                # so dragging a handle updates those boxes (and the live RSM via
+                # the contrast @state.change handler), and typing in the boxes
+                # moves the handles. The boxes seed the initial values; this
+                # slider is the quick post-view adjustment control.
+                html.Strong(
+                    "Contrast Limits",
+                    style="display:block; margin-bottom:6px; font-size:0.95rem;",
+                )
+                with html.Div(classes="dual-slider"):
+                    html.Div(classes="track")
+                    html.Div(
+                        classes="fill",
+                        style=(
+                            "`left:${Math.min(contrast_lo,contrast_hi)}%;"
+                            "right:${100-Math.max(contrast_lo,contrast_hi)}%`",
+                        ),
+                    )
+                    html.Input(
+                        type="range",
+                        v_model=("contrast_lo", 1.0),
+                        min=0,
+                        max=100,
+                        step=0.1,
+                    )
+                    html.Input(
+                        type="range",
+                        v_model=("contrast_hi", 99.8),
+                        min=0,
+                        max=100,
+                        step=0.1,
+                    )
+                html.Div(
+                    "{{ Number(contrast_lo).toFixed(1) }}% \u2013 "
+                    "{{ Number(contrast_hi).toFixed(1) }}%",
+                    style=(
+                        "margin-bottom:14px; font-size:0.8rem; color:#aaaaaa; "
+                        "text-align:center; font-variant-numeric:tabular-nums;"
+                    ),
+                )
                 html.Strong(
                     "Layers",
                     style="display:block; margin-bottom:10px; font-size:0.95rem;",
