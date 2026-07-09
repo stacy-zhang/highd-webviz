@@ -10,6 +10,8 @@ import sys
 import types
 import re
 
+import vtkplotlib as vpl
+
 import numpy as np
 import yaml
 import vtkmodules.vtkRenderingOpenGL2  # noqa: F401
@@ -68,12 +70,31 @@ RSMDataloader_CMS = _data_io.RSMDataloader_CMS
 write_rsm_volume_to_vtr = _data_io.write_rsm_volume_to_vtr
 RSMBuilder = _rsm3d.RSMBuilder
 
-try:
-    import matplotlib
-    import matplotlib.cm as mpl_cm
-    _HAS_MATPLOTLIB = True
-except ImportError:
-    _HAS_MATPLOTLIB = False
+
+def _cmap_rgb(colormap: str, n: int = 256) -> Optional[np.ndarray]:
+    """Sample an ``(n, 3)`` RGB array from a vtkplotlib colormap.
+
+    Uses vtkplotlib's ``colors.as_vtk_cmap`` to resolve the named colormap into
+    a ``vtkLookupTable`` and reads the RGB entries back out. Centralizing the
+    colormap lookup here means both the volume transfer function and the
+    slice/probe lookup tables share vtkplotlib's colormapping instead of
+    sampling matplotlib colormaps directly. Returns ``None`` when the colormap
+    can't be resolved so callers can fall back to grayscale.
+    """
+    try:
+        lut = vpl.colors.as_vtk_cmap(colormap, cache=False)
+    except Exception:
+        return None
+    count = int(lut.GetNumberOfTableValues())
+    if count <= 0:
+        return None
+    idx = np.linspace(0.0, count - 1, n).round().astype(int)
+    rgb = np.empty((n, 3), dtype=float)
+    for j, i in enumerate(idx):
+        r, g, b, _a = lut.GetTableValue(int(i))
+        rgb[j] = (r, g, b)
+    return rgb
+
 
 COLORMAP_NAMES = [
     "viridis",
@@ -138,14 +159,13 @@ def _apply_color_transfer_function(
     if hi <= lo:
         hi = lo + 1.0
 
-    if _HAS_MATPLOTLIB and colormap in matplotlib.colormaps:
-        cmap = mpl_cm.get_cmap(colormap)
+    colors = _cmap_rgb(colormap, 256)
+    if colors is not None:
         # Sample the colormap densely (matches _make_lookup_table and napari,
         # which use the full 256-entry LUT). The previous 8-point sampling made
         # VTK linearly interpolate in RGB between widely spaced control points,
         # which visibly distorts perceptual colormaps like viridis/turbo.
-        n = 256
-        colors = cmap(np.linspace(0.0, 1.0, n))[:, :3]
+        n = len(colors)
         for idx, rgb in enumerate(colors):
             t = lo + (hi - lo) * idx / (n - 1)
             color_tf.AddRGBPoint(float(t), float(rgb[0]), float(rgb[1]), float(rgb[2]))
@@ -216,7 +236,7 @@ def _robust_percentiles(
 
 
 def _make_lookup_table(colormap: str, value_range: Tuple[float, float]) -> vtkLookupTable:
-    """Build a vtkLookupTable for slice/probe actors from a matplotlib colormap."""
+    """Build a vtkLookupTable for slice/probe actors from a vtkplotlib colormap."""
     lut = vtkLookupTable()
     lo, hi = float(value_range[0]), float(value_range[1])
     if hi <= lo:
@@ -224,16 +244,15 @@ def _make_lookup_table(colormap: str, value_range: Tuple[float, float]) -> vtkLo
     n = 256
     lut.SetNumberOfTableValues(n) # specify total number of colors in the gradient
     lut.SetRange(lo, hi) # define min/max data values to map
-    if _HAS_MATPLOTLIB and colormap in matplotlib.colormaps:
-        cmap = mpl_cm.get_cmap(colormap)
-        colors = cmap(np.linspace(0.0, 1.0, n))
+    colors = _cmap_rgb(colormap, n)
+    if colors is not None:
         for i in range(n):
-            r, g, b, _ = colors[i]
+            r, g, b = colors[i]
             lut.SetTableValue(i, float(r), float(g), float(b), 1.0) # i is the index, A (transparency) is set to 1.0 for full opacity
     else:
         for i in range(n):
             t = i / (n - 1)
-            lut.SetTableValue(i, t, t, t, 1.0) # this creates a grayscale gradient if matplotlib is not available or the colormap is invalid
+            lut.SetTableValue(i, t, t, t, 1.0) # this creates a grayscale gradient if the colormap is unavailable or invalid
             # when R, G, and B, are equal, the color is a shade of gray, and the value of t determines how light/dark that shade is
     lut.Build()
     return lut
@@ -491,6 +510,16 @@ def create_server():
     state.setdefault("rendering", "attenuated_mip")
     state.setdefault("contrast_lo", 1.0)
     state.setdefault("contrast_hi", 99.8)
+    # Absolute (display-value) contrast window that the right-panel "Contrast
+    # Limits" slider drives. napari seeds contrast_limits once from the
+    # percentile boxes at view time, then lets the user adjust the *absolute*
+    # limits with a linear mapping -- these mirror that live window, while
+    # clim_min/clim_max are the slider bounds (the display data min/max).
+    state.setdefault("clim_lo", 0.0)
+    state.setdefault("clim_hi", 1.0)
+    state.setdefault("clim_min", 0.0)
+    state.setdefault("clim_max", 1.0)
+    state.setdefault("clim_step", 0.01)
     state.setdefault("export_path", str(Path.cwd() / "rsm_output.vtr"))
     # Grid (TIFF) and grid+edges (NPZ) export paths, mirroring the napari
     # widget's Export section.
@@ -989,6 +1018,42 @@ def create_server():
         state.status = entry  # most recent message (kept for convenience)
         state.flush()
 
+    def _seed_clim(display: np.ndarray) -> Tuple[float, float]:
+        """Seed the absolute contrast window from the percentile boxes.
+
+        Mirrors napari's launch behaviour: the contrast_lo/contrast_hi
+        percentiles pick an initial (lo, hi) *display-value* window, and the
+        slider bounds (clim_min/clim_max) are set to the full display min/max.
+        After this, the right-panel slider adjusts the absolute limits directly
+        (linear mapping), so the contrast response matches the napari desktop
+        app instead of re-running percentiles on every drag.
+        """
+        finite = display[np.isfinite(display)]
+        if finite.size == 0:
+            dmin, dmax = 0.0, 1.0
+        else:
+            dmin, dmax = float(finite.min()), float(finite.max())
+        if dmax <= dmin:
+            dmax = dmin + 1.0
+        lo = _float(getattr(state, "contrast_lo", 1.0), 1.0)
+        hi = _float(getattr(state, "contrast_hi", 99.8), 99.8)
+        if not (0.0 <= lo < hi <= 100.0):
+            lo, hi = 1.0, 99.8
+        clo, chi = _robust_percentiles(display, (lo, hi))
+        # Clamp the seed inside the slider bounds and keep a positive span.
+        clo = max(dmin, min(clo, dmax))
+        chi = max(dmin, min(chi, dmax))
+        if chi <= clo:
+            chi = min(dmax, clo + (dmax - dmin) * 1e-3)
+            if chi <= clo:
+                chi = clo + 1.0
+        state.clim_min = dmin
+        state.clim_max = dmax
+        state.clim_step = max((dmax - dmin) / 1000.0, 1e-6)
+        state.clim_lo = clo
+        state.clim_hi = chi
+        return (clo, chi)
+
     def _update_rendering():
         if current_volume is None:
             return
@@ -1064,11 +1129,7 @@ def create_server():
             display_volume = _log1p_clip(current_volume)
         else:
             display_volume = np.maximum(current_volume, 0.0)
-        lo = _float(getattr(state, "contrast_lo", 1.0), 1.0)
-        hi = _float(getattr(state, "contrast_hi", 99.8), 99.8)
-        if not (0.0 <= lo < hi <= 100.0):
-            lo, hi = 1.0, 99.8
-        render_range = _robust_percentiles(display_volume, (lo, hi))
+        render_range = _seed_clim(display_volume)
 
         image = vtkImageData()
         nx, ny, nz = display_volume.shape
@@ -1987,6 +2048,12 @@ def create_server():
             _set_status("Regrid first.")
             return
         _set_status("Updating 3D view...")
+        # Reset the contrast limits to their defaults each time the RSM is
+        # (re)viewed, so the user starts from the standard 1-99.8% window and
+        # can then fine-tune it with the right-panel slider. Set before
+        # _set_volume_data so it frames the transfer functions over the defaults.
+        state.contrast_lo = 1.0
+        state.contrast_hi = 99.8
         _set_volume_data(regrid_volume, regrid_axes)
         _set_status("RSM volume displayed.")
 
@@ -2381,7 +2448,7 @@ def create_server():
             # Reset to the first frame; the change handler will render it.
             state.intensity_frame_index = 0
         try:
-            _show_intensity_frame(0, reset_camera=True)
+            _show_intensity_frame(0, reset_camera=True, reseed=True)
         except Exception as exc:
             _set_status(f"Intensity view error: {exc}")
             return
@@ -2405,7 +2472,7 @@ def create_server():
         ])
         _set_status(f"Viewing intensity frames (0–{n - 1}). Use the slider to scrub.")
 
-    def _show_intensity_frame(index, reset_camera=False):
+    def _show_intensity_frame(index, reset_camera=False, reseed=False):
         """Display a single raw intensity frame as a 2D image slice."""
         nonlocal intensity_nx, intensity_ny
         if not current_frames:
@@ -2420,16 +2487,23 @@ def create_server():
             return
 
         # Mirror the volume display path: log-compress and frame the colormap
-        # over robust contrast percentiles.
+        # over the absolute contrast window. On the initial view we seed the
+        # window from the percentile boxes; subsequent renders (frame scrub or
+        # slider drag) reuse the current clim_lo/clim_hi so the contrast the
+        # user set persists across frames, matching napari.
         if bool(getattr(state, "log_view", True)):
             disp = _log1p_clip(frame)
         else:
             disp = np.maximum(frame, 0.0)
-        lo = _float(getattr(state, "contrast_lo", 1.0), 1.0)
-        hi = _float(getattr(state, "contrast_hi", 99.8), 99.8)
-        if not (0.0 <= lo < hi <= 100.0):
-            lo, hi = 1.0, 99.8
-        frange = _robust_percentiles(disp, (lo, hi))
+        if reseed:
+            frange = _seed_clim(disp)
+        else:
+            frange = (
+                _float(getattr(state, "clim_lo", 0.0), 0.0),
+                _float(getattr(state, "clim_hi", 1.0), 1.0),
+            )
+            if frange[1] <= frange[0]:
+                frange = _seed_clim(disp)
 
         ny, nx = disp.shape
         intensity_nx, intensity_ny = nx, ny
@@ -2987,26 +3061,57 @@ def create_server():
             state.exp_energy = 12.398419843320026 / wavelength
             _ew_sync["busy"] = False
 
-    # Live-update the volume rendering when the contrast percentiles change.
-    # Only the transfer-function range depends on contrast_lo/hi (the scalar
-    # data fed to VTK is unchanged), so we just recompute render_range from the
-    # current display volume and re-apply the color/opacity functions -- far
-    # cheaper than rebuilding the vtkImageData via refresh_rendering. An
-    # out-of-order value while the user is mid-edit (lo >= hi) is ignored.
+    # The View-tab percentile boxes seed the *absolute* contrast window.
+    # Editing them recomputes clim_lo/clim_hi (display-value limits) from the
+    # requested percentiles of the currently displayed data; the clim change
+    # handler below then applies that window. This mirrors napari, where the
+    # percentile spinboxes set the initial contrast_limits and the live
+    # contrast control operates on absolute data values afterwards.
     @state.change("contrast_lo", "contrast_hi")
     def _on_contrast_change(**kwargs):
-        nonlocal render_range
-        if current_volume is None:
-            return
         lo = _float(getattr(state, "contrast_lo", 1.0), 1.0)
         hi = _float(getattr(state, "contrast_hi", 99.8), 99.8)
         if not (0.0 <= lo < hi <= 100.0):
+            return
+        if bool(getattr(state, "intensity_slider_show", False)) and current_frames:
+            n = len(current_frames)
+            idx = max(0, min(int(_float(getattr(state, "intensity_frame_index", 0), 0)), n - 1))
+            frame = np.asarray(current_frames[idx], dtype=np.float32)
+            if frame.ndim != 2:
+                frame = np.squeeze(frame)
+            if frame.ndim != 2:
+                return
+            disp = _log1p_clip(frame) if bool(getattr(state, "log_view", True)) else np.maximum(frame, 0.0)
+            _seed_clim(disp)
+            return
+        if current_volume is None:
             return
         if bool(getattr(state, "log_view", True)):
             display_volume = _log1p_clip(current_volume)
         else:
             display_volume = np.maximum(current_volume, 0.0)
-        render_range = _robust_percentiles(display_volume, (lo, hi))
+        _seed_clim(display_volume)
+
+    # Live-update the rendering when the absolute contrast window (driven by the
+    # right-panel "Contrast Limits" slider, or by _seed_clim above) changes.
+    # Only the transfer-function range depends on it -- the scalar data fed to
+    # VTK is unchanged -- so we re-apply the color/opacity functions over the
+    # new [clim_lo, clim_hi] window. An inverted window (hi <= lo) is ignored.
+    @state.change("clim_lo", "clim_hi")
+    def _on_clim_change(**kwargs):
+        nonlocal render_range
+        lo = _float(getattr(state, "clim_lo", 0.0), 0.0)
+        hi = _float(getattr(state, "clim_hi", 1.0), 1.0)
+        if hi <= lo:
+            return
+        render_range = (lo, hi)
+        if bool(getattr(state, "intensity_slider_show", False)) and current_frames:
+            _show_intensity_frame(
+                int(_float(getattr(state, "intensity_frame_index", 0), 0))
+            )
+            return
+        if current_volume is None:
+            return
         _update_rendering()
         _update_all_slices()
         render_window.Render()
@@ -3320,10 +3425,6 @@ def create_server():
                         html.Input(v_model=("log_view", ""), type="checkbox", style="margin-right:8px;")
                         html.Span("Log view")
 
-                    html.Label("Colormap", style=_lbl)
-                    with html.Select(v_model=("colormap", ""), style=_inp):
-                        for name in COLORMAP_NAMES:
-                            html.Option(name, value=name)
                     html.Label("Rendering", style=_lbl)
                     with html.Select(v_model=("rendering", ""), style=_inp):
                         html.Option("attenuated_mip", value="attenuated_mip")
@@ -3580,12 +3681,29 @@ def create_server():
                     "font-family:sans-serif;"
                 ),
             ):
-                # Contrast Limits dual-range slider. Bound to the same
-                # contrast_lo / contrast_hi state as the View-tab input boxes,
-                # so dragging a handle updates those boxes (and the live RSM via
-                # the contrast @state.change handler), and typing in the boxes
-                # moves the handles. The boxes seed the initial values; this
-                # slider is the quick post-view adjustment control.
+                # Colormap selector. Bound to the same ``colormap`` state the
+                # volume/slice transfer functions read; changing it refreshes
+                # the rendering live (like the Contrast Limits slider below).
+                # The colors themselves come from vtkplotlib's colormapping
+                # (see _cmap_rgb / vpl.colors.as_vtk_cmap).
+                html.Strong(
+                    "Colormap",
+                    style="display:block; margin-bottom:6px; font-size:0.95rem;",
+                )
+                with html.Select(
+                    v_model=("colormap", ""),
+                    change=ctrl.refresh_rendering,
+                    style="width:100%; margin-bottom:14px;",
+                ):
+                    for name in COLORMAP_NAMES:
+                        html.Option(name, value=name)
+                # Contrast Limits dual-range slider. Bound to the absolute
+                # clim_lo / clim_hi display-value window (seeded once from the
+                # View-tab percentile boxes at view time), ranging over the
+                # display data min/max (clim_min / clim_max). Dragging a handle
+                # adjusts the absolute contrast limits with a linear mapping,
+                # matching napari's live contrast control -- the percentile
+                # boxes only seed the initial window.
                 html.Strong(
                     "Contrast Limits",
                     style="display:block; margin-bottom:6px; font-size:0.95rem;",
@@ -3595,27 +3713,29 @@ def create_server():
                     html.Div(
                         classes="fill",
                         style=(
-                            "`left:${Math.min(contrast_lo,contrast_hi)}%;"
-                            "right:${100-Math.max(contrast_lo,contrast_hi)}%`",
+                            "`left:${clim_max>clim_min?"
+                            "(Math.min(clim_lo,clim_hi)-clim_min)/(clim_max-clim_min)*100:0}%;"
+                            "right:${clim_max>clim_min?"
+                            "(1-(Math.max(clim_lo,clim_hi)-clim_min)/(clim_max-clim_min))*100:0}%`",
                         ),
                     )
                     html.Input(
                         type="range",
-                        v_model=("contrast_lo", 1.0),
-                        min=0,
-                        max=100,
-                        step=0.1,
+                        v_model=("clim_lo", 0.0),
+                        min=("clim_min",),
+                        max=("clim_max",),
+                        step=("clim_step",),
                     )
                     html.Input(
                         type="range",
-                        v_model=("contrast_hi", 99.8),
-                        min=0,
-                        max=100,
-                        step=0.1,
+                        v_model=("clim_hi", 1.0),
+                        min=("clim_min",),
+                        max=("clim_max",),
+                        step=("clim_step",),
                     )
                 html.Div(
-                    "{{ Number(contrast_lo).toFixed(1) }}% \u2013 "
-                    "{{ Number(contrast_hi).toFixed(1) }}%",
+                    "{{ Number(clim_lo).toPrecision(3) }} \u2013 "
+                    "{{ Number(clim_hi).toPrecision(3) }}",
                     style=(
                         "margin-bottom:14px; font-size:0.8rem; color:#aaaaaa; "
                         "text-align:center; font-variant-numeric:tabular-nums;"
