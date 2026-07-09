@@ -189,18 +189,16 @@ def _apply_opacity_function(
     if hi <= lo:
         hi = lo + 1.0
     opacity_scale = max(0.0, min(float(opacity_scale), 4.0))
-    span = hi - lo
-    # Keep the low-intensity background fully transparent and ramp opacity up
-    # steeply toward the bright end so concentrated Bragg peaks render as solid,
-    # crisp features. The previous ramp gave the low/mid range non-trivial
-    # opacity (0.02-0.12); because most RSM voxels are background, composite
-    # ray-casting accumulated that into a translucent fog that washed out the
-    # peaks (faint) and filled the volume with a diffuse haze (blurry).
+    # Match napari's image-volume rendering. napari maps each voxel through the
+    # colormap + contrast limits and does NOT apply any custom opacity ramp, so
+    # the value->appearance relationship is linear across the contrast range:
+    # intensities at the low limit fade out and intensities at the high limit
+    # are shown fully. A single linear opacity ramp from lo->hi reproduces that.
+    # The previous steep ramp forced everything below 35% of the range fully
+    # transparent and muted the 35-80% mid-range, which hid the diffuse and
+    # mid-intensity structure that napari clearly renders.
     opacity_tf.AddPoint(lo, 0.0)
-    opacity_tf.AddPoint(lo + 0.35 * span, 0.0)
-    opacity_tf.AddPoint(lo + 0.55 * span, min(1.0, 0.08 * opacity_scale))
-    opacity_tf.AddPoint(lo + 0.80 * span, min(1.0, 0.45 * opacity_scale))
-    opacity_tf.AddPoint(hi, min(1.0, 1.0 * opacity_scale))
+    opacity_tf.AddPoint(hi, min(1.0, opacity_scale))
 
 
 def _log1p_clip(a: np.ndarray) -> np.ndarray:
@@ -561,7 +559,10 @@ def create_server():
     state.setdefault("sph_cmap", "viridis")
 
     state.setdefault("blend_mode", 0)
-    state.setdefault("shade", True)
+    # napari renders image volumes unshaded (no lighting model). Default shade
+    # off so the web app matches napari's flat colormap appearance; shading only
+    # affects translucent/composite modes (VTK ignores it for MIP).
+    state.setdefault("shade", False)
     state.setdefault("opacity_scale", 1.0)
     state.setdefault("colormap", "viridis")
     state.setdefault("status", "Ready")
@@ -1159,6 +1160,18 @@ def create_server():
 
         image.SetSpacing(*spacings)
         image.SetOrigin(*origin)
+
+        # Regridded RSM volumes contain non-finite voxels (NaN/inf) wherever a
+        # grid cell received no detector samples -- mean-normalization divides
+        # by a zero weight there. _log1p_clip propagates those NaNs, and VTK's
+        # vtkColorTransferFunction renders NaN through its NanColor (a dark red
+        # by default) instead of the colormap, tinting the whole RSM render with
+        # the wrong color even though the colormap itself is correct. (The 2D
+        # intensity view comes from raw detector frames with no gaps, so it
+        # looked fine.) Replace non-finite voxels with the display floor so they
+        # map to the fully transparent background instead of the NaN color.
+        fill = float(render_range[0]) if render_range is not None else 0.0
+        display_volume = np.where(np.isfinite(display_volume), display_volume, fill)
 
         # Reverse the volume along z so the mirrored origin above still places
         # each voxel at world z = -(its true Qz).
