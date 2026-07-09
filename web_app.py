@@ -54,16 +54,18 @@ from trame.ui.html import DivLayout
 from trame.widgets import html
 from trame.widgets.vtk import VtkRemoteView
 
-PACKAGE_NAME = "src"
-PACKAGE_PATH = Path(__file__).resolve().parent / PACKAGE_NAME
+PACKAGE_NAME = "rsm3d"
+# The rsm3d code now lives inside the ``voxel`` package (voxel/rsm3d), so the
+# package directory is one level deeper than web_app.py rather than a sibling.
+PACKAGE_PATH = Path(__file__).resolve().parent / "voxel" / PACKAGE_NAME
 
 if PACKAGE_NAME not in sys.modules:
     package_module = types.ModuleType(PACKAGE_NAME)
     package_module.__path__ = [str(PACKAGE_PATH)]
     sys.modules[PACKAGE_NAME] = package_module
 
-_data_io = importlib.import_module("src.data_io")
-_rsm3d = importlib.import_module("src.rsm3d")
+_data_io = importlib.import_module("rsm3d.data_io")
+_rsm3d = importlib.import_module("rsm3d.rsm3d")
 
 RSMDataLoader_ISR = _data_io.RSMDataLoader_ISR
 RSMDataloader_CMS = _data_io.RSMDataloader_CMS
@@ -434,7 +436,7 @@ def _parse_grid_shape(
 
 # partly copied from resview_widget.py
 DEFAULTS_ENV = "RSM3D_DEFAULTS_YAML"
-# The bundled defaults YAML lives inside the src package, not next to
+# The bundled defaults YAML lives inside the rsm3d package, not next to
 # web_app.py. Use PACKAGE_PATH so the auto-filled setup path points at the file
 # that actually exists (web_app.py sits one directory above the package, so
 # Path(__file__).with_name(...) would resolve to a non-existent root-level file).
@@ -603,6 +605,11 @@ def create_server():
     # active view. Each entry is {"key", "name", "visible"} and drives one row
     # (name + eye toggle) in the panel. Rebuilt whenever the active view changes.
     state.setdefault("layers", [])
+    # Key of the currently selected layer (napari-style). Clicking a layer row
+    # selects it, highlighting the row and showing that layer's own controls
+    # (colormap / contrast / opacity ...) at the top of the panel, so edits
+    # target the selected layer instead of always the volume.
+    state.setdefault("selected_layer", "")
     # Inline SVG markup for the layer visibility toggle, injected via v-html.
     state.setdefault("eye_on_svg", _EYE_ON_SVG)
     state.setdefault("eye_off_svg", _EYE_OFF_SVG)
@@ -2882,6 +2889,12 @@ def create_server():
             {"key": key, "name": name, "visible": _layer_is_visible(key)}
             for key, name in items
         ]
+        # Keep the selection valid: if the previously selected layer is gone
+        # (e.g. a slice was hidden and dropped from the list), fall back to the
+        # first layer so the top-of-panel controls always target a real layer.
+        keys = [key for key, _ in items]
+        if state.selected_layer not in keys:
+            state.selected_layer = keys[0] if keys else ""
 
     def _rebuild_volume_layers():
         """List the layers present in the 3D volume view (volume + active slices)."""
@@ -3714,65 +3727,153 @@ def create_server():
                     "font-family:sans-serif;"
                 ),
             ):
-                # Colormap selector. Bound to the same ``colormap`` state the
-                # volume/slice transfer functions read; the @state.change
-                # handler refreshes the rendering live (like the Contrast Limits
-                # slider below). The colors themselves come from vtkplotlib's
-                # colormapping (see _cmap_rgb / vpl.colors.as_vtk_cmap).
-                html.Strong(
-                    "Colormap",
-                    style="display:block; margin-bottom:6px; font-size:0.95rem;",
-                )
-                with html.Select(
-                    v_model=("colormap", ""),
-                    style="width:100%; margin-bottom:14px;",
-                ):
-                    for name in COLORMAP_NAMES:
-                        html.Option(name, value=name)
-                # Contrast Limits dual-range slider. Bound to the absolute
-                # clim_lo / clim_hi display-value window (seeded once from the
-                # View-tab percentile boxes at view time), ranging over the
-                # display data min/max (clim_min / clim_max). Dragging a handle
-                # adjusts the absolute contrast limits with a linear mapping,
-                # matching napari's live contrast control -- the percentile
-                # boxes only seed the initial window.
-                html.Strong(
-                    "Contrast Limits",
-                    style="display:block; margin-bottom:6px; font-size:0.95rem;",
-                )
-                with html.Div(classes="dual-slider"):
-                    html.Div(classes="track")
-                    html.Div(
-                        classes="fill",
-                        style=(
-                            "`left:${clim_max>clim_min?"
-                            "(Math.min(clim_lo,clim_hi)-clim_min)/(clim_max-clim_min)*100:0}%;"
-                            "right:${clim_max>clim_min?"
-                            "(1-(Math.max(clim_lo,clim_hi)-clim_min)/(clim_max-clim_min))*100:0}%`",
-                        ),
-                    )
-                    html.Input(
-                        type="range",
-                        v_model=("clim_lo", 0.0),
-                        min=("clim_min",),
-                        max=("clim_max",),
-                        step=("clim_step",),
-                    )
-                    html.Input(
-                        type="range",
-                        v_model=("clim_hi", 1.0),
-                        min=("clim_min",),
-                        max=("clim_max",),
-                        step=("clim_step",),
-                    )
+                # ---- Selected-layer controls (napari-style) -------------
+                # napari shows the controls for the *selected* layer at the top
+                # of the layer panel; which set appears depends on
+                # ``selected_layer``. Each control is bound to that layer's own
+                # state (e.g. slice_cmap / cyl_cmap vs. the volume's colormap),
+                # so editing the colormap here affects only the selected layer.
+                # The colors themselves come from vtkplotlib's colormapping (see
+                # _cmap_rgb / vpl.colors.as_vtk_cmap).
+                _pl_hdr = "display:block; margin-bottom:6px; font-size:0.95rem;"
+                _pl_lbl = "display:block; margin:10px 0 4px; font-size:0.85rem; color:#bbbbbb;"
+                _pl_inp = "width:100%; margin-bottom:6px;"
+                _slice_cmaps = ["turbo", "viridis", "inferno", "plasma", "gray", "hsv"]
+
+                # Selected-layer name header.
                 html.Div(
-                    "{{ Number(clim_lo).toPrecision(3) }} \u2013 "
-                    "{{ Number(clim_hi).toPrecision(3) }}",
+                    "{{ (layers.find(l => l.key === selected_layer) || {}).name }}",
+                    v_show="selected_layer",
                     style=(
-                        "margin-bottom:14px; font-size:0.8rem; color:#aaaaaa; "
-                        "text-align:center; font-variant-numeric:tabular-nums;"
+                        "margin-bottom:10px; font-size:0.9rem; font-weight:600; "
+                        "color:#6aa9ff; white-space:nowrap; overflow:hidden; "
+                        "text-overflow:ellipsis;"
                     ),
                 )
+
+                # Volume / intensity image: colormap + contrast limits.
+                with html.Div(
+                    v_if="selected_layer === 'volume' || selected_layer === 'intensity_map'"
+                ):
+                    html.Strong("Colormap", style=_pl_hdr)
+                    with html.Select(v_model=("colormap", ""), style=_pl_inp):
+                        for name in COLORMAP_NAMES:
+                            html.Option(name, value=name)
+                    # Contrast Limits dual-range slider. Bound to the absolute
+                    # clim_lo / clim_hi display-value window (seeded once from
+                    # the View-tab percentile boxes at view time), ranging over
+                    # the display data min/max (clim_min / clim_max). Dragging a
+                    # handle adjusts the absolute contrast limits with a linear
+                    # mapping, matching napari's live contrast control.
+                    html.Strong("Contrast Limits", style=_pl_hdr + " margin-top:12px;")
+                    with html.Div(classes="dual-slider"):
+                        html.Div(classes="track")
+                        html.Div(
+                            classes="fill",
+                            style=(
+                                "`left:${clim_max>clim_min?"
+                                "(Math.min(clim_lo,clim_hi)-clim_min)/(clim_max-clim_min)*100:0}%;"
+                                "right:${clim_max>clim_min?"
+                                "(1-(Math.max(clim_lo,clim_hi)-clim_min)/(clim_max-clim_min))*100:0}%`",
+                            ),
+                        )
+                        html.Input(
+                            type="range",
+                            v_model=("clim_lo", 0.0),
+                            min=("clim_min",),
+                            max=("clim_max",),
+                            step=("clim_step",),
+                        )
+                        html.Input(
+                            type="range",
+                            v_model=("clim_hi", 1.0),
+                            min=("clim_min",),
+                            max=("clim_max",),
+                            step=("clim_step",),
+                        )
+                    html.Div(
+                        "{{ Number(clim_lo).toPrecision(3) }} \u2013 "
+                        "{{ Number(clim_hi).toPrecision(3) }}",
+                        style=(
+                            "margin-bottom:14px; font-size:0.8rem; color:#aaaaaa; "
+                            "text-align:center; font-variant-numeric:tabular-nums;"
+                        ),
+                    )
+
+                # Orthogonal slice (x/y/z share one colormap + opacity).
+                with html.Div(
+                    v_if="selected_layer === 'slice_x' || selected_layer === 'slice_y' || selected_layer === 'slice_z'"
+                ):
+                    html.Strong("Colormap", style=_pl_hdr)
+                    with html.Select(
+                        v_model=("slice_cmap", ""), change=ctrl.update_slices, style=_pl_inp
+                    ):
+                        for name in _slice_cmaps:
+                            html.Option(name, value=name)
+                    html.Label("Opacity", style=_pl_lbl)
+                    html.Input(
+                        v_model=("slice_opacity", ""), type="number", min="0", max="1",
+                        step="0.1", change=ctrl.update_slices, style=_pl_inp,
+                    )
+
+                # Cylindrical probe surface.
+                with html.Div(v_if="selected_layer === 'cylinder'"):
+                    html.Strong("Colormap", style=_pl_hdr)
+                    with html.Select(
+                        v_model=("cyl_cmap", ""), change=ctrl.update_slices, style=_pl_inp
+                    ):
+                        for name in _slice_cmaps:
+                            html.Option(name, value=name)
+                    html.Label("Opacity", style=_pl_lbl)
+                    html.Input(
+                        v_model=("cyl_opacity", ""), type="number", min="0", max="1",
+                        step="0.1", change=ctrl.update_slices, style=_pl_inp,
+                    )
+                    html.Label("Radius (\u00c5\u207b\u00b9)", style=_pl_lbl)
+                    html.Input(
+                        v_model=("cyl_radius", ""), type="number", min="0", max="10",
+                        step="0.01", change=ctrl.update_slices, style=_pl_inp,
+                    )
+                    html.Label("Angular samples", style=_pl_lbl)
+                    html.Input(
+                        v_model=("cyl_samples", ""), type="number", min="16", max="360",
+                        step="8", change=ctrl.update_slices, style=_pl_inp,
+                    )
+
+                # Spherical probe surface.
+                with html.Div(v_if="selected_layer === 'sphere'"):
+                    html.Strong("Colormap", style=_pl_hdr)
+                    with html.Select(
+                        v_model=("sph_cmap", ""), change=ctrl.update_slices, style=_pl_inp
+                    ):
+                        for name in _slice_cmaps:
+                            html.Option(name, value=name)
+                    html.Label("Opacity", style=_pl_lbl)
+                    html.Input(
+                        v_model=("sph_opacity", ""), type="number", min="0", max="1",
+                        step="0.1", change=ctrl.update_slices, style=_pl_inp,
+                    )
+                    html.Label("Radius (\u00c5\u207b\u00b9)", style=_pl_lbl)
+                    html.Input(
+                        v_model=("sph_radius", ""), type="number", min="0", max="10",
+                        step="0.01", change=ctrl.update_slices, style=_pl_inp,
+                    )
+                    html.Label("Angular samples", style=_pl_lbl)
+                    html.Input(
+                        v_model=("sph_samples", ""), type="number", min="16", max="180",
+                        step="8", change=ctrl.update_slices, style=_pl_inp,
+                    )
+
+                # Layers with no adjustable image properties (overlays/markers).
+                with html.Div(
+                    v_if="['outline','world_axes','roi','cross'].indexOf(selected_layer) !== -1"
+                ):
+                    html.Div(
+                        "No adjustable properties for this layer.",
+                        style="margin-bottom:14px; font-size:0.82rem; color:#888888;",
+                    )
+
+                html.Hr(style="border-color:#2a2a2e; margin:6px 0 12px;")
                 html.Strong(
                     "Layers",
                     style="display:block; margin-bottom:10px; font-size:0.95rem;",
@@ -3780,11 +3881,16 @@ def create_server():
                 with html.Div(
                     v_for="(layer, li) in layers",
                     key="layer.key",
+                    # Clicking anywhere on the row selects the layer (napari
+                    # style), swapping the controls above to that layer's own.
+                    click="selected_layer = layer.key",
+                    # Highlight the selected row blue (background + border).
                     style=(
-                        "position:relative; display:flex; align-items:center; "
+                        "`position:relative; display:flex; align-items:center; "
                         "height:36px; margin-bottom:8px; padding:0 10px; "
-                        "background:#2a2a2e; border:1px solid #44444a; "
-                        "border-radius:6px; user-select:none;"
+                        "background:${layer.key === selected_layer ? '#1e3a5f' : '#2a2a2e'}; "
+                        "border:1px solid ${layer.key === selected_layer ? '#6aa9ff' : '#44444a'}; "
+                        "border-radius:6px; user-select:none; cursor:pointer;`",
                     ),
                 ):
                     # Eye toggle: an inline SVG eye / eye-off glyph (injected
