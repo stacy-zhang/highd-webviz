@@ -558,9 +558,12 @@ def create_server():
     state.setdefault("slice_cmap", "turbo")
     state.setdefault("slice_show_border", True)
 
-    ## bounding box outline (rectangular prism drawn around the volume, with
-    ## (Qx, Qy, Qz) coordinate labels at each corner)
+    ## bounding box outline (rectangular prism drawn around the volume)
     state.setdefault("outline_show", True)
+
+    ## per-corner (Qx, Qy, Qz) coordinate labels -- a separate toggleable layer
+    ## from the outline box so the coordinates can be shown/hidden on their own
+    state.setdefault("coords_show", True)
 
     ## world axes overlay (colored +Qx/+Qy/+Qz direction arrows rooted at the
     ## volume's origin corner -- a visual orientation guide, mirrors napari)
@@ -758,13 +761,16 @@ def create_server():
     renderer.AddActor(outline_actor)
 
     # One camera-facing text label per corner, showing that corner's
-    # (Qx, Qy, Qz) coordinate. They share the outline layer's visibility.
+    # (Qx, Qy, Qz) coordinate. They live on their own "Coordinates" layer
+    # (toggled via ``coords_show``, independent of the outline box) and are
+    # colored violet to stand apart from the outline box wireframe.
+    _coord_label_color = (0.57, 1.00, 0.85)
     outline_label_actors = []
     for _c in range(8):
         _label = vtkBillboardTextActor3D()
         _label.SetInput("")
         _label.GetTextProperty().SetFontSize(14)
-        _label.GetTextProperty().SetColor(0.85, 0.85, 0.9)
+        _label.GetTextProperty().SetColor(*_coord_label_color)
         _label.GetTextProperty().SetJustificationToCentered()
         _label.PickableOff()
         _label.VisibilityOff()
@@ -1411,7 +1417,8 @@ def create_server():
         decimals) so the two front-ends read identically.
         """
         show = bool(getattr(state, "outline_show", True))
-        if current_image is None or current_axes is None or not show:
+        show_coords = bool(getattr(state, "coords_show", True))
+        if current_image is None or current_axes is None:
             outline_actor.VisibilityOff()
             for label in outline_label_actors:
                 label.VisibilityOff()
@@ -1444,9 +1451,9 @@ def create_server():
             label = outline_label_actors[c]
             label.SetInput(f"{n0}={x:.3f}, {n1}={y:.3f}, {n2}={z:.3f}")
             label.SetPosition(x, y, wz)
-            label.VisibilityOn()
+            label.SetVisibility(1 if show_coords else 0)
         outline_pts.Modified()
-        outline_actor.VisibilityOn()
+        outline_actor.SetVisibility(1 if show else 0)
 
     def _update_world_axes():
         """Draw +Qx/+Qy/+Qz direction arrows from the reciprocal-space origin.
@@ -2962,6 +2969,7 @@ def create_server():
         return {
             "volume": volume_actor,
             "outline": outline_actor,
+            "coords": outline_label_actors[0] if outline_label_actors else None,
             "world_axes": world_axes_actors[0] if world_axes_actors else None,
             "intensity_map": intensity_actor,
             "roi": roi_outline_actor,
@@ -2994,7 +3002,7 @@ def create_server():
         """List the layers present in the 3D volume view (volume + active slices)."""
         if bool(getattr(state, "intensity_slider_show", False)):
             return  # the intensity view manages its own layer list
-        items = [("volume", "RSM Volume"), ("outline", "Outline Box"), ("world_axes", "World Axes")]
+        items = [("volume", "RSM Volume"), ("outline", "Outline Box"), ("coords", "Coordinates"), ("world_axes", "World Axes")]
         for ax, lbl in (("x", "Slice X"), ("y", "Slice Y"), ("z", "Slice Z")):
             if slice_actors[ax].GetVisibility():
                 items.append((f"slice_{ax}", lbl))
@@ -3024,6 +3032,9 @@ def create_server():
             volume_actor.SetVisibility(1 if visible else 0)
         elif key == "outline":
             state.outline_show = visible
+            _update_outline_box()
+        elif key == "coords":
+            state.coords_show = visible
             _update_outline_box()
         elif key == "world_axes":
             state.world_axes_show = visible
