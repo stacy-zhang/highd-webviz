@@ -37,10 +37,8 @@ from vtkmodules.vtkCommonDataModel import (
     vtkPolyData,
     vtkPolyLine,
 )
-from vtkmodules.vtkCommonTransforms import vtkTransform
 from vtkmodules.vtkFiltersCore import vtkGlyph3D, vtkProbeFilter
-from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
-from vtkmodules.vtkFiltersSources import vtkConeSource, vtkCylinderSource, vtkLineSource, vtkRegularPolygonSource, vtkSphereSource  # cylinder/sphere meshes for slicing; line + cone build the world-axes arrows
+from vtkmodules.vtkFiltersSources import vtkConeSource, vtkLineSource, vtkRegularPolygonSource, vtkSphereSource  # sphere mesh for slicing; line + cone build the world-axes arrows
 from vtkmodules.vtkRenderingCore import (
     vtkActor,
     vtkBillboardTextActor3D,  # camera-facing text placed at a fixed 3D point
@@ -982,48 +980,109 @@ def create_server():
         actor.VisibilityOn()
 
     def _update_cylinder():
-        if current_image is None:
+        if current_image is None or render_range is None:
             cyl_actor.VisibilityOff()
             return
         show = bool(state.cyl_show)
         if not show:
             cyl_actor.VisibilityOff()
             return
-        center = current_image.GetCenter()
-        _, zhi = _axis_bounds(current_image, 2)
-        zlo, _ = _axis_bounds(current_image, 2)
-        height = max(1e-6, zhi - zlo)
-        radius = _float(state.cyl_radius, 1.0)
-        samples = max(8, int(_float(state.cyl_samples, 64)))
-        src = vtkCylinderSource()
-        src.SetRadius(radius)
-        src.SetHeight(height)
-        src.SetResolution(samples)
-        src.CappingOff()
-        src.Update()
+
         # A cylindrical slice in reciprocal space is |Q_xy| = radius around the
         # Qz axis at the Q-space ORIGIN (Qx = Qy = 0), spanning the full Qz
         # range -- matching napari's _extract_cylindrical_surface_mesh
-        # (qx = r*cos θ, qy = r*sin θ). Rooting the tube at the volume's
-        # geometric center instead put its axis through mostly-empty grid cells
-        # (filled with the transparent display floor), so the probe sampled no
-        # real structure and the cylinder rendered as a uniform color unrelated
-        # to the RSM. World x/y map directly to Qx/Qy (positive spacing, origin
-        # = axis[0]), so Qx = Qy = 0 is world x = y = 0; only z uses the
-        # volume's z-center so the tube stays vertical and spans the full range.
-        # vtkCylinderSource is aligned to Y; rotate so its axis lies along Z and
-        # translate onto the Qz axis.
-        tf = vtkTransform()
-        tf.Translate(0.0, 0.0, center[2])
-        tf.RotateX(90.0)
-        tpd = vtkTransformPolyDataFilter()
-        tpd.SetTransform(tf)
-        tpd.SetInputData(src.GetOutput())
-        tpd.Update()
-        _probe_surface(
-            cyl_actor, tpd.GetOutput(), _ensure_path(state.cyl_cmap),
-            _float(state.cyl_opacity, 0.7), show,
+        # (qx = r*cos θ, qy = r*sin θ, sampled with np.argmin nearest-neighbor).
+        #
+        # We build and sample the mesh manually instead of using vtkProbeFilter.
+        # vtkProbeFilter MASKS any surface point that falls outside the volume
+        # bounds (setting it to 0), and a radius-~1 tube around the origin lies
+        # almost entirely outside the small Qx/Qy extent of a typical RSM -- so
+        # the probe returned no real data and the cylinder rendered as a flat,
+        # uniform color unrelated to the map. Clamping each vertex to the
+        # nearest edge voxel (like napari) guarantees every vertex carries a
+        # meaningful intensity so the surface colors track the RSM.
+        radius = _float(state.cyl_radius, 1.0)
+        samples = max(8, int(_float(state.cyl_samples, 64)))
+
+        dims = current_image.GetDimensions()
+        nx, ny, nz = int(dims[0]), int(dims[1]), int(dims[2])
+        if nx < 1 or ny < 1 or nz < 2:
+            cyl_actor.VisibilityOff()
+            return
+        ox, oy, oz = (float(v) for v in current_image.GetOrigin())
+        sx, sy, sz = (float(v) for v in current_image.GetSpacing())
+
+        # Pull the display volume back out of current_image. It was uploaded as
+        # an x-fastest F-ravel of a (nx, ny, nz) array (see _set_volume_data),
+        # so a C-order reshape to (nz, ny, nx) indexes as vol[k, j, i].
+        flat = numpy_support.vtk_to_numpy(current_image.GetPointData().GetScalars())
+        vol = np.asarray(flat, dtype=np.float32).reshape(nz, ny, nx)
+
+        # Circle of world (x, y) = (Qx, Qy) samples at |Q_xy| = radius; close
+        # the loop by repeating the first angle at the end.
+        theta = np.linspace(0.0, 2.0 * np.pi, samples + 1)
+        n_theta = int(theta.size)
+        xs = radius * np.cos(theta)
+        ys = radius * np.sin(theta)
+
+        # Nearest voxel index for each angle (clamped into range like np.argmin).
+        i_idx = np.clip(np.round((xs - ox) / sx).astype(int), 0, nx - 1) if sx else np.zeros(n_theta, dtype=int)
+        j_idx = np.clip(np.round((ys - oy) / sy).astype(int), 0, ny - 1) if sy else np.zeros(n_theta, dtype=int)
+
+        # Sample every z-slab at the clamped (i, j) ring: shape (nz, n_theta).
+        sampled = vol[:, j_idx, i_idx].astype(np.float32)
+
+        # Vertex coordinates, ordered k (outer) then theta (inner) so vertex
+        # index = k * n_theta + t matches ``sampled`` raveled in C order.
+        zc = oz + np.arange(nz, dtype=np.float64) * sz
+        coords = np.empty((nz * n_theta, 3), dtype=np.float64)
+        coords[:, 0] = np.tile(xs, nz)
+        coords[:, 1] = np.tile(ys, nz)
+        coords[:, 2] = np.repeat(zc, n_theta)
+
+        points = vtkPoints()
+        points.SetData(numpy_support.numpy_to_vtk(coords, deep=True))
+
+        poly = vtkPolyData()
+        poly.SetPoints(points)
+        cells = vtkCellArray()
+        for k in range(nz - 1):
+            base = k * n_theta
+            nbase = base + n_theta
+            for t in range(n_theta - 1):
+                v00 = base + t
+                v01 = base + t + 1
+                v10 = nbase + t
+                v11 = nbase + t + 1
+                cells.InsertNextCell(3)
+                cells.InsertCellPoint(v00)
+                cells.InsertCellPoint(v01)
+                cells.InsertCellPoint(v11)
+                cells.InsertNextCell(3)
+                cells.InsertCellPoint(v00)
+                cells.InsertCellPoint(v11)
+                cells.InsertCellPoint(v10)
+        poly.SetPolys(cells)
+
+        vtk_scalars = numpy_support.numpy_to_vtk(
+            np.ascontiguousarray(sampled.ravel(order="C")),
+            deep=True,
+            array_type=numpy_support.get_vtk_array_type(np.float32),
         )
+        vtk_scalars.SetName("intensity")
+        poly.GetPointData().SetScalars(vtk_scalars)
+
+        lut = _make_lookup_table(_ensure_path(state.cyl_cmap), render_range)
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(poly)
+        mapper.SetLookupTable(lut)
+        mapper.SetScalarRange(render_range[0], render_range[1])
+        mapper.SetScalarModeToUsePointData()
+        mapper.SelectColorArray("intensity")
+        mapper.SetColorModeToMapScalars()
+        cyl_actor.SetMapper(mapper)
+        cyl_actor.GetProperty().SetOpacity(_float(state.cyl_opacity, 0.7))
+        cyl_actor.VisibilityOn()
 
     def _update_sphere():
         if current_image is None:
