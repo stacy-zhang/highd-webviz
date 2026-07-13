@@ -2959,6 +2959,21 @@ def create_server():
         if remote_view is not None:
             remote_view.update()
 
+    # Live-update the Analysis-tab slicing colormaps (orthogonal / cylindrical /
+    # spherical) the moment the user picks a new one from the dropdown, without
+    # needing to toggle the slice off and on again. The select's own
+    # ``change=ctrl.update_slices`` handler can miss the fresh value because the
+    # v-model hasn't flushed yet; a state.change observer always sees the new
+    # value, so it re-slices reliably.
+    @state.change("slice_cmap", "cyl_cmap", "sph_cmap")
+    def _on_slice_cmap_change(**kwargs):
+        if current_volume is None:
+            return
+        _update_all_slices()
+        render_window.Render()
+        if remote_view is not None:
+            remote_view.update()
+
     # Clamp the CMS angle step to the valid [0, 360] range. Corrects a typed out-of-range value.
     @state.change("cms_angle_step")
     def _on_cms_angle_step_change(cms_angle_step=None, **kwargs):
