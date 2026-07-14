@@ -170,3 +170,138 @@ def _make_lookup_table(colormap: str, value_range: Tuple[float, float]) -> vtkLo
             lut.SetTableValue(i, t, t, t, 1.0)  # grayscale fallback
     lut.Build()
     return lut
+
+
+def attenuated_mip_image(
+    volume: np.ndarray,
+    origin: Tuple[float, float, float],
+    spacing: Tuple[float, float, float],
+    near_pts: np.ndarray,
+    far_pts: np.ndarray,
+    value_range: Tuple[float, float],
+    colormap: str,
+    *,
+    attenuation: float = 0.05,
+    n_samples: int = 256,
+) -> np.ndarray:
+    """CPU emulation of napari's attenuated maximum-intensity projection.
+
+    This is the faithful substitute for napari's ``attenuated_mip`` rendering
+    that VTK cannot express on this host (its smart volume mapper has no
+    attenuated-MIP blend mode, and the GPU shader-replacement API is missing
+    from the installed build; the render window also falls back to the
+    ``llvmpipe`` software rasteriser, so there is no GPU to lean on). Instead of
+    asking VTK to render, we cast one ray per output pixel through the volume in
+    NumPy and reproduce napari's exact formula:
+
+        along each ray (front -> back), normalise each sample to the contrast
+        window [lo, hi], then weight it by ``exp(-attenuation * sum_in_front)``
+        and keep the running maximum.
+
+    The exponential falloff dims deeper/weaker samples so only strong peaks
+    survive, which is what makes napari's view read as clean, high-contrast
+    peaks on a dark background instead of VTK's flat MIP where background haze
+    bleeds over everything.
+
+    Parameters
+    ----------
+    volume : (nx, ny, nz) float32
+        The display-scaled (e.g. log-compressed), NaN-free volume, laid out
+        exactly as it is shown -- i.e. read straight back from the displayed
+        ``vtkImageData`` so ``origin``/``spacing`` place it correctly.
+    origin, spacing : length-3
+        World placement of ``volume[0, 0, 0]`` and the per-axis voxel size, as
+        reported by the displayed ``vtkImageData``.
+    near_pts, far_pts : (H, W, 3) float
+        World-space ray entry (near plane) and exit (far plane) points for each
+        output pixel, with row 0 at the top of the image. The caller builds
+        these from the live VTK camera so the projection matches the 3D view.
+    value_range : (lo, hi)
+        Contrast window (same one driving the VTK transfer functions).
+    colormap : str
+        Colormap name (resolved through the shared ``_cmap_rgb`` helper so the
+        snapshot matches the volume's colors).
+    attenuation : float
+        napari's attenuation coefficient (default 0.05), applied to values
+        normalised into [0, 1].
+    n_samples : int
+        Number of samples taken along each ray between the near and far planes.
+
+    Returns
+    -------
+    (H, W, 3) uint8 RGB image.
+    """
+    vol = np.ascontiguousarray(volume, dtype=np.float32)
+    nx, ny, nz = vol.shape
+    origin = np.asarray(origin, dtype=np.float64)
+    spacing = np.asarray(spacing, dtype=np.float64)
+    spacing = np.where(np.abs(spacing) < 1e-12, 1.0, spacing)
+
+    H, W = near_pts.shape[:2]
+    P0 = near_pts.reshape(-1, 3).astype(np.float64)
+    P1 = far_pts.reshape(-1, 3).astype(np.float64)
+    npx = P0.shape[0]
+
+    lo, hi = float(value_range[0]), float(value_range[1])
+    if hi <= lo:
+        hi = lo + 1.0
+    inv_span = 1.0 / (hi - lo)
+
+    out_val = np.full(npx, -np.inf, dtype=np.float32)  # running attenuated max
+    acc = np.zeros(npx, dtype=np.float32)              # normalised intensity in front
+
+    step = P1 - P0
+    for s in range(n_samples):
+        t = s / (n_samples - 1) if n_samples > 1 else 0.0
+        P = P0 + step * t
+        # world -> continuous voxel index
+        fx = (P[:, 0] - origin[0]) / spacing[0]
+        fy = (P[:, 1] - origin[1]) / spacing[1]
+        fz = (P[:, 2] - origin[2]) / spacing[2]
+        valid = (
+            (fx >= 0) & (fx <= nx - 1)
+            & (fy >= 0) & (fy <= ny - 1)
+            & (fz >= 0) & (fz <= nz - 1)
+        )
+        nval = np.zeros(npx, dtype=np.float32)
+        if valid.any():
+            xf = fx[valid]
+            yf = fy[valid]
+            zf = fz[valid]
+            x0 = np.floor(xf).astype(np.int32)
+            y0 = np.floor(yf).astype(np.int32)
+            z0 = np.floor(zf).astype(np.int32)
+            x1 = np.minimum(x0 + 1, nx - 1)
+            y1 = np.minimum(y0 + 1, ny - 1)
+            z1 = np.minimum(z0 + 1, nz - 1)
+            dx = (xf - x0).astype(np.float32)
+            dy = (yf - y0).astype(np.float32)
+            dz = (zf - z0).astype(np.float32)
+            # trilinear interpolation of the 8 surrounding voxels
+            c00 = vol[x0, y0, z0] * (1 - dx) + vol[x1, y0, z0] * dx
+            c10 = vol[x0, y1, z0] * (1 - dx) + vol[x1, y1, z0] * dx
+            c01 = vol[x0, y0, z1] * (1 - dx) + vol[x1, y0, z1] * dx
+            c11 = vol[x0, y1, z1] * (1 - dx) + vol[x1, y1, z1] * dx
+            c0 = c00 * (1 - dy) + c10 * dy
+            c1 = c01 * (1 - dy) + c11 * dy
+            interp = c0 * (1 - dz) + c1 * dz
+            # normalise into the contrast window, matching napari's clim texture
+            nval[valid] = np.clip((interp - lo) * inv_span, 0.0, 1.0)
+        # attenuate by the intensity already accumulated in front (excludes the
+        # current sample), then keep the running maximum
+        weight = np.exp(-attenuation * acc)
+        cand = np.where(valid, nval * weight, -np.inf)
+        out_val = np.maximum(out_val, cand)
+        acc += nval
+
+    norm = np.where(np.isfinite(out_val), out_val, 0.0)
+    norm = np.clip(norm, 0.0, 1.0)
+    idx = np.clip((norm * 255.0).astype(np.int32), 0, 255)
+
+    colors = _cmap_rgb(colormap, 256)
+    if colors is None:
+        rgb = np.stack([norm, norm, norm], axis=-1)
+    else:
+        rgb = colors[idx]
+    rgb8 = (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8).reshape(H, W, 3)
+    return rgb8

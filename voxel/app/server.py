@@ -14,7 +14,9 @@ state, so they are intentionally kept together inside ``create_server``.
 
 import os
 import asyncio
+import base64
 import gc
+import io
 import math
 import time
 from pathlib import Path
@@ -98,6 +100,7 @@ from voxel.visualization.colormaps import (
     _log1p_clip,
     _robust_percentiles,
     _make_lookup_table,
+    attenuated_mip_image,
 )
 
 # --- static UI assets (ui) ---------------------------------------------
@@ -287,6 +290,18 @@ def create_server():
     # When False the fill width tracks ``progress_value`` from real per-frame
     # callbacks (build/regrid).
     state.setdefault("progress_indeterminate", False)
+
+    # High-quality snapshot overlay. napari's "attenuated_mip" look can't be
+    # produced by this VTK build (no attenuated-MIP blend mode / GPU shader
+    # hooks, software rasteriser only), so the "HQ Snapshot" button renders a
+    # faithful CPU attenuated-MIP of the current view and shows it as an image
+    # layered over the live viewer. ``hq_snapshot_show`` toggles the overlay and
+    # ``hq_snapshot_src`` holds the PNG data URI. The overlay is dismissed
+    # automatically as soon as the camera is moved (see the interaction
+    # observer) so it never lingers as a stale image over a rotated volume.
+    state.setdefault("hq_snapshot_show", False)
+    state.setdefault("hq_snapshot_src", "")
+    state.setdefault("hq_snapshot_busy", False)
 
     renderer = vtkRenderer()
     renderer.SetBackground(0.10, 0.10, 0.12)
@@ -2710,6 +2725,121 @@ def create_server():
             remote_view.update()
 
     # ---------------------------------------------------------------------
+    # High-quality attenuated-MIP snapshot
+    # ---------------------------------------------------------------------
+    def _camera_ray_points(width, height):
+        """World-space near/far ray points for each output pixel.
+
+        Uses the live VTK camera (via the renderer's display<->world transform)
+        so the CPU projection matches exactly what the 3D view shows. For a
+        pinhole/parallel camera the near and far clipping planes are planar in
+        world space, so bilinearly interpolating the four display-corner world
+        points reproduces every pixel's ray endpoints exactly -- far cheaper
+        than calling DisplayToWorld per pixel. Row 0 of the returned arrays is
+        the top of the image (VTK display y grows upward, so the top edge maps
+        to the maximum display y).
+        """
+        win_w, win_h = render_window.GetSize()
+        max_x = float(win_w - 1)
+        max_y = float(win_h - 1)
+
+        def _corner(dx, dy, dz):
+            renderer.SetDisplayPoint(dx, dy, dz)
+            renderer.DisplayToWorld()
+            wx, wy, wz, ww = renderer.GetWorldPoint()
+            if ww != 0.0:
+                wx, wy, wz = wx / ww, wy / ww, wz / ww
+            return np.array([wx, wy, wz], dtype=np.float64)
+
+        # image corners -> display coords (top row = max display y)
+        corners_disp = {
+            "tl": (0.0, max_y),
+            "tr": (max_x, max_y),
+            "bl": (0.0, 0.0),
+            "br": (max_x, 0.0),
+        }
+        near = {k: _corner(dx, dy, 0.0) for k, (dx, dy) in corners_disp.items()}
+        far = {k: _corner(dx, dy, 1.0) for k, (dx, dy) in corners_disp.items()}
+
+        u = np.linspace(0.0, 1.0, width)[None, :, None]   # across columns
+        v = np.linspace(0.0, 1.0, height)[:, None, None]  # down rows
+
+        def _bilerp(cn):
+            top = cn["tl"] * (1 - u) + cn["tr"] * u
+            bot = cn["bl"] * (1 - u) + cn["br"] * u
+            return top * (1 - v) + bot * v
+
+        return _bilerp(near), _bilerp(far)
+
+    def _do_hq_snapshot():
+        if current_image is None or render_range is None:
+            _set_status("View an RSM volume before taking a snapshot.")
+            return
+        state.hq_snapshot_busy = True
+        state.flush()
+        try:
+            # Read the displayed volume straight back from the vtkImageData so
+            # its origin/spacing/values (already log-scaled, z-flipped and
+            # NaN-filled) match the 3D view exactly -- no need to redo any of
+            # that bookkeeping here.
+            dims = current_image.GetDimensions()
+            scal = current_image.GetPointData().GetScalars()
+            vol = numpy_support.vtk_to_numpy(scal).reshape(dims, order="F")
+            origin = current_image.GetOrigin()
+            spacing = current_image.GetSpacing()
+
+            # Cap the output resolution so a rotated (trilinear) projection
+            # stays a few seconds at most on the software rasteriser; the
+            # browser scales the image up to fill the viewer.
+            win_w, win_h = render_window.GetSize()
+            long_edge = max(win_w, win_h)
+            scale = min(1.0, 720.0 / float(long_edge)) if long_edge > 0 else 1.0
+            out_w = max(2, int(round(win_w * scale)))
+            out_h = max(2, int(round(win_h * scale)))
+
+            near_pts, far_pts = _camera_ray_points(out_w, out_h)
+            rgb = attenuated_mip_image(
+                vol,
+                origin,
+                spacing,
+                near_pts,
+                far_pts,
+                render_range,
+                _ensure_path(state.colormap),
+                attenuation=0.05,
+                n_samples=256,
+            )
+            from PIL import Image
+            buf = io.BytesIO()
+            Image.fromarray(rgb, mode="RGB").save(buf, format="PNG")
+            data_uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+            state.hq_snapshot_src = data_uri
+            state.hq_snapshot_show = True
+            _set_status("High-quality attenuated-MIP snapshot rendered.")
+        except Exception as exc:  # pragma: no cover - defensive UI feedback
+            _set_status(f"Snapshot failed: {exc}")
+        finally:
+            state.hq_snapshot_busy = False
+            state.flush()
+
+    @ctrl.set("hq_snapshot")
+    def hq_snapshot(**kwargs):
+        _do_hq_snapshot()
+
+    @ctrl.set("close_hq_snapshot")
+    def close_hq_snapshot(**kwargs):
+        state.hq_snapshot_show = False
+        state.flush()
+
+    def _dismiss_snapshot_on_interaction(obj, event):
+        # As soon as the user starts moving the camera, the overlay image no
+        # longer matches the view, so hide it and let the live volume show.
+        if state.hq_snapshot_show:
+            state.hq_snapshot_show = False
+            state.flush()
+
+    interactor.AddObserver("StartInteractionEvent", _dismiss_snapshot_on_interaction)
+    # ---------------------------------------------------------------------
     # Layer control panel (right side)
     # ---------------------------------------------------------------------
     # Maps each layer key to the VTK prop that backs it, so we can read the
@@ -3336,6 +3466,17 @@ def create_server():
                         html.Button("\u21BB Refresh", click=ctrl.refresh_rendering, style=_btn)
                         html.Button("\u23F9 Stop", click=ctrl.stop_task, style=_btn)
 
+                    # Faithful napari-style attenuated-MIP snapshot of the
+                    # current view (CPU-rendered; takes a few seconds). Disabled
+                    # while a snapshot is already rendering.
+                    html.Button(
+                        "{{ hq_snapshot_busy ? '\u23F3 Rendering\u2026' : "
+                        "'\u2728 HQ Snapshot (attenuated MIP)' }}",
+                        click=ctrl.hq_snapshot,
+                        disabled=("hq_snapshot_busy",),
+                        style="width:100%; margin-top:8px; padding:10px 8px; cursor:pointer;",
+                    )
+
                     with html.Div(style="display:flex; align-items:center; margin-top:14px;"):
                         html.Input(v_model=("log_view", ""), type="checkbox", style="margin-right:8px;")
                         html.Span("Log view")
@@ -3532,7 +3673,47 @@ def create_server():
                 # closure variable that _update_rendering()/_set_volume_data()
                 # read, so live renders now have a surface to push to.
                 with html.Div(style="flex:1; min-height:0; position:relative;"):
-                    remote_view = VtkRemoteView(render_window, interactive_ratio=1)
+                    remote_view = VtkRemoteView(
+                        render_window,
+                        interactive_ratio=1,
+                        # Send the settled (mouse-released) frame at maximum JPEG
+                        # quality. The remote view streams the off-screen render
+                        # to the browser as a compressed image; the default
+                        # still-frame quality softens the map with compression
+                        # artifacts. This only affects how the already-rendered
+                        # image is encoded for transport -- it does not change
+                        # the VTK rendering math -- so the settled RSM view is
+                        # as crisp as the server rendered it.
+                        still_quality=100,
+                    )
+                    # HQ attenuated-MIP snapshot overlay. Covers the live view
+                    # with the CPU-rendered image; a corner button dismisses it
+                    # (moving the camera also auto-dismisses it, see the
+                    # StartInteractionEvent observer). object-fit:contain keeps
+                    # the aspect ratio while the browser scales the capped-
+                    # resolution PNG up to fill the viewer.
+                    with html.Div(
+                        v_show="hq_snapshot_show",
+                        style=(
+                            "position:absolute; inset:0; background:#0f0f12; "
+                            "display:flex; align-items:center; justify-content:center; "
+                            "z-index:20;"
+                        ),
+                    ):
+                        html.Img(
+                            src=("hq_snapshot_src",),
+                            style="max-width:100%; max-height:100%; object-fit:contain;",
+                        )
+                        html.Button(
+                            "\u2715 Close",
+                            click=ctrl.close_hq_snapshot,
+                            style=(
+                                "position:absolute; top:10px; right:12px; "
+                                "padding:6px 12px; cursor:pointer; "
+                                "background:#2a2a2e; color:#f0f0f0; "
+                                "border:1px solid #44444a; border-radius:4px;"
+                            ),
+                        )
                 # Frame slider: visible after "View Intensity" so the user can
                 # scrub through the loaded frame range one frame at a time.
                 with html.Div(
