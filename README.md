@@ -58,7 +58,7 @@ pixi run start
 or equivalently:
 
 ```bash
-pixi run python main.py
+pixi run python -m voxel
 ```
 
 The server will:
@@ -69,7 +69,7 @@ The server will:
 ### Command-Line Options
 
 ```bash
-pixi run python main.py --help
+pixi run python -m voxel --help
 ```
 
 Options:
@@ -81,10 +81,10 @@ Options:
 
 ```bash
 # Run on port 8080, accessible from any interface
-pixi run python main.py --port 8080 --host 0.0.0.0
+pixi run python -m voxel --port 8080 --host 0.0.0.0
 
 # Run on localhost without opening browser
-pixi run python main.py --no-browser
+pixi run python -m voxel --no-browser
 ```
 
 ## Usage Workflow
@@ -132,16 +132,19 @@ pixi run python main.py --no-browser
 
 ## Application Architecture
 
-### `main.py`
-Entry point that parses command-line arguments and launches the Trame server.
+### Entry points
+The application is launched as a package module:
 
-### `web_app.py`
-Thin backward-compatibility shim that re-exports `create_server` / `run_server`
-from `voxel.app.server`, so `import web_app` and `main.py` keep working.
+- `python -m voxel` — package entry ([voxel/__main__.py](voxel/__main__.py) → [voxel/cli.py](voxel/cli.py))
+- `pixi run start` — the pixi task (runs `python -m voxel`)
+
+The CLI argument parsing lives in [voxel/cli.py](voxel/cli.py); it calls
+`run_server()` in [voxel/app/server.py](voxel/app/server.py).
 
 ### Package layout (`voxel/`)
 The application is split by concern so new data types, reconstruction methods,
 or visualization capabilities can be added in isolation:
+
 
 - **`voxel/services`** — data access and state coercion:
   - `backend.py`: bridge that imports the headless `rsm3d` loaders/builder and
@@ -191,7 +194,7 @@ or visualization capabilities can be added in isolation:
 ### App Won't Start
 - Ensure the Pixi environment is installed: `pixi install`
 - Check Python version: `pixi run python --version` should show 3.11.x
-- Verify imports: `pixi run python -c "import web_app; print('OK')"`
+- Verify imports: `pixi run python -c "from voxel.app.server import create_server; print('OK')"`
 
 ### Data Load Fails
 - Verify file paths are absolute and correct
