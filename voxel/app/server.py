@@ -43,14 +43,17 @@ from vtkmodules.vtkFiltersCore import vtkGlyph3D, vtkProbeFilter
 from vtkmodules.vtkFiltersSources import vtkConeSource, vtkLineSource, vtkRegularPolygonSource, vtkSphereSource  # sphere mesh for slicing; line + cone build the world-axes arrows
 from vtkmodules.vtkRenderingCore import (
     vtkActor,
+    vtkActor2D,  # 2D overlay prop drawn in display coordinates (scale bar)
     vtkBillboardTextActor3D,  # camera-facing text placed at a fixed 3D point
     vtkColorTransferFunction,
     vtkCoordinate,  # converts between viewport/world coordinate systems
     vtkImageSlice,
     vtkPolyDataMapper,
+    vtkPolyDataMapper2D,  # maps polydata to 2D display space (scale bar)
     vtkRenderer,
     vtkRenderWindow,
     vtkRenderWindowInteractor,
+    vtkTextActor,  # 2D text placed at a display-space position (scale-bar label)
     vtkVolume,
     vtkVolumeProperty,
 )
@@ -71,7 +74,7 @@ from trame.widgets.vtk import VtkRemoteView
 from voxel.services.backend import (
     RSMDataLoader_ISR,
     RSMDataloader_CMS,
-    write_rsm_volume_to_vtr,
+    write_rsm_volume_to_vtr_compat,
     RSMBuilder,
     DEFAULTS_ENV,
     yaml_path,
@@ -496,6 +499,46 @@ def create_server():
         world_axes_actors.append(_la)
         world_axes_actors.append(_ca)
         world_axes_labels.append(_wlbl)
+
+    # --- Scale bar --------------------------------------------------------
+    # A small ruler pinned to the bottom-right corner of the viewer showing how
+    # long a "nice" round distance is on screen. It is a pure 2D overlay drawn
+    # directly in display (pixel) coordinates, so it stays a fixed size in the
+    # corner regardless of camera zoom/orbit; the labelled length is recomputed
+    # from the camera every render (see _update_scale_bar) so the number tracks
+    # the current zoom. It is shown only for the RSM volume view: reciprocal-
+    # space Q uses 1/Å (or 1/kÅ when the distance is tiny) and HKL uses r.l.u.
+    # (the raw intensity frame is in detector-pixel space, so no bar is drawn).
+    scalebar_pts = vtkPoints()
+    scalebar_pts.SetNumberOfPoints(4)
+    scalebar_poly = vtkPolyData()
+    scalebar_poly.SetPoints(scalebar_pts)
+    _scalebar_cells = vtkCellArray()
+    for _a, _b in ((0, 1), (0, 2), (1, 3)):  # main bar + two end ticks
+        _seg = vtkLine()
+        _seg.GetPointIds().SetId(0, _a)
+        _seg.GetPointIds().SetId(1, _b)
+        _scalebar_cells.InsertNextCell(_seg)
+    scalebar_poly.SetLines(_scalebar_cells)
+    scalebar_mapper = vtkPolyDataMapper2D()
+    scalebar_mapper.SetInputData(scalebar_poly)
+    scalebar_actor = vtkActor2D()
+    scalebar_actor.SetMapper(scalebar_mapper)
+    scalebar_actor.GetProperty().SetColor(0.92, 0.92, 0.95)
+    scalebar_actor.GetProperty().SetLineWidth(2.0)
+    scalebar_actor.PickableOff()
+    scalebar_actor.VisibilityOff()
+    renderer.AddActor2D(scalebar_actor)
+
+    scalebar_label = vtkTextActor()
+    scalebar_label.SetInput("")
+    scalebar_label.GetTextProperty().SetFontSize(14)
+    scalebar_label.GetTextProperty().SetColor(0.92, 0.92, 0.95)
+    scalebar_label.GetTextProperty().SetJustificationToCentered()
+    scalebar_label.GetTextProperty().SetVerticalJustificationToBottom()
+    scalebar_label.PickableOff()
+    scalebar_label.VisibilityOff()
+    renderer.AddActor2D(scalebar_label)
 
     # --- Intensity frame viewer: a single 2D image slice scrubbed by the
     # bottom slider (View Intensity). Hidden until the user enables it.
@@ -1311,6 +1354,114 @@ def create_server():
     # Keep the arrows a constant on-screen size: recompute their world length
     # from the camera at the start of every render (covers interactive zoom).
     renderer.AddObserver("StartEvent", _rescale_world_axes)
+
+    def _scalebar_world_per_px():
+        """World units spanned by one screen pixel at the camera focal point.
+
+        Parallel projection gives an exact value (parallel scale is half the
+        viewport height in world units); perspective is evaluated at the focal
+        point so the bar reflects the distance most of the scene sits at.
+        """
+        size = render_window.GetSize()
+        win_h = int(size[1]) if size and len(size) > 1 else 0
+        if win_h <= 0:
+            return None
+        cam = renderer.GetActiveCamera()
+        if cam is None:
+            return None
+        if cam.GetParallelProjection():
+            return (2.0 * float(cam.GetParallelScale())) / win_h
+        cpos = np.asarray(cam.GetPosition(), dtype=float)
+        fpos = np.asarray(cam.GetFocalPoint(), dtype=float)
+        dist = float(np.linalg.norm(fpos - cpos))
+        if dist <= 0.0:
+            return None
+        view_angle = np.deg2rad(float(cam.GetViewAngle()))
+        return (2.0 * dist * np.tan(view_angle / 2.0)) / win_h
+
+    def _scalebar_nice(value):
+        """Largest 1/2/5 x 10^n that does not exceed ``value`` (a round ruler)."""
+        if not np.isfinite(value) or value <= 0.0:
+            return 0.0
+        exp = math.floor(math.log10(value))
+        base = 10.0 ** exp
+        frac = value / base
+        if frac >= 5.0:
+            nice = 5.0
+        elif frac >= 2.0:
+            nice = 2.0
+        else:
+            nice = 1.0
+        return nice * base
+
+    def _scalebar_hide():
+        scalebar_actor.VisibilityOff()
+        scalebar_label.VisibilityOff()
+
+    def _update_scale_bar(*_):
+        """Redraw the corner scale bar for the current view and camera zoom."""
+        # Only the RSM volume view gets a scale bar. The intensity frame is in
+        # raw detector-pixel space, and converting that to 1/Å from geometry
+        # didn't match napari's readout, so the bar is hidden there.
+        if not volume_actor.GetVisibility() or intensity_actor.GetVisibility():
+            _scalebar_hide()
+            return
+
+        world_per_px = _scalebar_world_per_px()
+        if world_per_px is None or world_per_px <= 0.0:
+            _scalebar_hide()
+            return
+
+        # Aim for a ~120px bar, then snap the length down to a round number.
+        target_px = 120.0
+        nice_world = _scalebar_nice(target_px * world_per_px)
+        if nice_world <= 0.0:
+            _scalebar_hide()
+            return
+        bar_px = nice_world / world_per_px
+        if not np.isfinite(bar_px) or bar_px < 2.0:
+            _scalebar_hide()
+            return
+
+        # Format the value + unit: reciprocal-space Q uses 1/Å, switching to
+        # 1/kÅ once the value drops below 1 1/Å (e.g. 0.5 1/Å -> 500 1/kÅ);
+        # crystallographic space uses r.l.u.
+        is_q = (_ensure_path(getattr(state, "space", "q")) or "q").lower() == "q"
+        if is_q:
+            if nice_world < 1.0:
+                label = f"{nice_world * 1000.0:g} 1/k\u00c5"
+            else:
+                label = f"{nice_world:g} 1/\u00c5"
+        else:
+            label = f"{nice_world:g} r.l.u."
+
+        size = render_window.GetSize()
+        win_w = int(size[0]) if size and len(size) > 0 else 0
+        if win_w <= 0:
+            _scalebar_hide()
+            return
+
+        # Display coordinates have their origin at the bottom-left, so a small
+        # y sits near the bottom edge; place the bar in the bottom-right corner.
+        margin = 18.0
+        tick = 6.0
+        x1 = win_w - margin
+        x0 = x1 - bar_px
+        y = margin
+        scalebar_pts.SetPoint(0, x0, y, 0.0)
+        scalebar_pts.SetPoint(1, x1, y, 0.0)
+        scalebar_pts.SetPoint(2, x0, y + tick, 0.0)
+        scalebar_pts.SetPoint(3, x1, y + tick, 0.0)
+        scalebar_pts.Modified()
+        scalebar_actor.VisibilityOn()
+
+        scalebar_label.SetInput(label)
+        scalebar_label.SetDisplayPosition(int(round((x0 + x1) / 2.0)), int(round(y + tick + 3.0)))
+        scalebar_label.VisibilityOn()
+
+    # Recompute the corner scale bar's length/label before every render so it
+    # tracks the current zoom (same StartEvent hook as the world-axes rescale).
+    renderer.AddObserver("StartEvent", _update_scale_bar)
 
     def _update_all_slices():
         try:
@@ -2628,8 +2779,8 @@ def create_server():
             _start_progress("Exporting VTR", indeterminate=True)
             await loop.run_in_executor(
                 None,
-                lambda: write_rsm_volume_to_vtr(
-                    current_volume, current_axes, str(output_path), binary=True, compress=True
+                lambda: write_rsm_volume_to_vtr_compat(
+                    current_volume, current_axes, str(output_path), compress=True
                 ),
             )
             state.export_path = str(output_path)
