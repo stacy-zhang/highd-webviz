@@ -4112,6 +4112,14 @@ def create_server():
                         html.Div(
                             v_for="(pt, pi) in opacity_points",
                             key=("pi",),
+                            # trame's html.Div only registers a fixed set of DOM
+                            # events (click / mousedown / dblclick / contextmenu
+                            # ...); pointer events are NOT among them, so they
+                            # must be declared explicitly via ``__events`` or the
+                            # ``@pointer*`` bindings are silently dropped (which
+                            # is why dragging did nothing while dblclick/
+                            # contextmenu worked).
+                            __events=["pointerdown", "pointermove", "pointerup"],
                             style=(
                                 "`position:absolute; left:${pt[0]*100}%; top:${(1-pt[1])*100}%;"
                                 " width:14px; height:14px; margin:-7px 0 0 -7px; border-radius:50%;"
@@ -4133,6 +4141,10 @@ def create_server():
                                 "if(pi===0){x=0;}else if(pi===pts.length-1){x=1;}"
                                 "else{x=Math.max(pts[pi-1][0]+0.005,Math.min(pts[pi+1][0]-0.005,x));}"
                                 "pts[pi]=[x,y];opacity_points=pts;"
+                            ),
+                            pointerup=(
+                                "try{$event.currentTarget.releasePointerCapture($event.pointerId);}"
+                                "catch(e){}"
                             ),
                             contextmenu=(
                                 "$event.preventDefault();$event.stopPropagation();"
