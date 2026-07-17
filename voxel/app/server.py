@@ -243,7 +243,7 @@ def create_server():
     # reproduces the previous linear napari-matching opacity. ``cmap_gradient``
     # is the CSS gradient painted behind the editor graph, kept in sync with the
     # active colormap so the x-axis reads as the real color range.
-    state.setdefault("opacity_points", [[0.0, 0.0], [1.0, 1.0]])
+    state.setdefault("opacity_points", [[0.0, 1.0], [1.0, 1.0]])
     state.setdefault("cmap_gradient", cmap_css_gradient("viridis"))
     state.setdefault("status", "Ready")
     state.setdefault("status_log", ["Ready"])
@@ -2583,7 +2583,13 @@ def create_server():
         plane.SetOrigin(0.0, 0.0, 0.0)
         plane.SetNormal(0.0, 0.0, 1.0)
 
-        lut = _make_lookup_table(_ensure_path(state.colormap), frange)
+        # Bake the opacity transfer function into the LUT's alpha channel so the
+        # 2D intensity viewer honors the opacity curve (the 3D MIP render can't).
+        lut = _make_lookup_table(
+            _ensure_path(state.colormap),
+            frange,
+            opacity_points=getattr(state, "opacity_points", None),
+        )
         prop = intensity_actor.GetProperty()
         prop.SetLookupTable(lut)
         prop.UseLookupTableScalarRangeOn()
@@ -3321,9 +3327,16 @@ def create_server():
     # Live-update the volume rendering when the ParaView-style opacity transfer
     # function is edited in the right panel. Only the opacity ramp changes -- the
     # scalar data fed to VTK is unchanged -- so we just re-apply the transfer
-    # functions over the current window and re-render.
+    # functions over the current window and re-render. For the 2D intensity
+    # viewer the opacity curve is baked into the LUT alpha (see
+    # _show_intensity_frame), so we redraw the current frame instead.
     @state.change("opacity_points")
     def _on_opacity_points_change(**kwargs):
+        if bool(getattr(state, "intensity_slider_show", False)) and current_frames:
+            _show_intensity_frame(
+                int(_float(getattr(state, "intensity_frame_index", 0), 0))
+            )
+            return
         if current_volume is None:
             return
         _update_rendering()
@@ -4068,10 +4081,16 @@ def create_server():
                         # with the colormap; the SVG "mask" polygon below paints
                         # the area ABOVE the line with the panel background, so
                         # only the region beneath the curve shows the gradient.
+                        # A vertical fade (dark at the bottom -> clear at the
+                        # top) is layered over the colormap so the fill also
+                        # reads as opacity: low-opacity columns sit near the
+                        # dimmed bottom, high-opacity columns reach the bright
+                        # top near the line.
                         html.Div(
                             style=(
-                                "{position:'absolute',inset:'0',"
-                                "pointerEvents:'none',background:cmap_gradient}",
+                                "{position:'absolute',inset:'0',pointerEvents:'none',"
+                                "background:'linear-gradient(to top, rgba(11,11,14,0.92) 0%,"
+                                " rgba(11,11,14,0.08) 100%), '+cmap_gradient}",
                             ),
                         )
                         # SVG overlay: filled area + polyline through the points.

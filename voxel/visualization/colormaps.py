@@ -212,24 +212,52 @@ def _robust_percentiles(
     return float(lo), float(hi)
 
 
-def _make_lookup_table(colormap: str, value_range: Tuple[float, float]) -> vtkLookupTable:
-    """Build a vtkLookupTable for slice/probe actors from a vtkplotlib colormap."""
+def _make_lookup_table(colormap: str, value_range: Tuple[float, float], opacity_points=None) -> vtkLookupTable:
+    """Build a vtkLookupTable for slice/probe/intensity actors from a vtkplotlib colormap.
+
+    ``opacity_points`` optionally bakes a per-value alpha into the table from
+    the ParaView-style opacity transfer function (``[x, y]`` control points with
+    ``x`` normalized 0..1 across ``value_range`` and ``y`` the opacity). This
+    lets the 2D intensity viewer honor the opacity curve even though the 3D MIP
+    render can't -- low-opacity intensities blend toward the background. When
+    omitted (slices / probes, which have their own opacity sliders) every entry
+    stays fully opaque.
+    """
     lut = vtkLookupTable()
     lo, hi = float(value_range[0]), float(value_range[1])
     if hi <= lo:
         hi = lo + 1.0
     n = 256
+
+    # Per-entry alpha from the opacity control points (linear interpolation over
+    # the normalized 0..1 x-axis, which matches the LUT's [lo, hi] range).
+    alphas = None
+    if opacity_points:
+        cleaned = []
+        for p in opacity_points:
+            try:
+                cleaned.append((float(p[0]), float(p[1])))
+            except (TypeError, ValueError, IndexError):
+                continue
+        if len(cleaned) >= 2:
+            cleaned.sort(key=lambda q: q[0])
+            xp = np.clip([q[0] for q in cleaned], 0.0, 1.0)
+            fp = np.clip([q[1] for q in cleaned], 0.0, 1.0)
+            alphas = np.clip(np.interp(np.linspace(0.0, 1.0, n), xp, fp), 0.0, 1.0)
+
     lut.SetNumberOfTableValues(n)  # specify total number of colors in the gradient
     lut.SetRange(lo, hi)  # define min/max data values to map
     colors = _cmap_rgb(colormap, n)
     if colors is not None:
         for i in range(n):
             r, g, b = colors[i]
-            lut.SetTableValue(i, float(r), float(g), float(b), 1.0)  # A=1.0 (opaque)
+            a = float(alphas[i]) if alphas is not None else 1.0
+            lut.SetTableValue(i, float(r), float(g), float(b), a)
     else:
         for i in range(n):
             t = i / (n - 1)
-            lut.SetTableValue(i, t, t, t, 1.0)  # grayscale fallback
+            a = float(alphas[i]) if alphas is not None else 1.0
+            lut.SetTableValue(i, t, t, t, a)  # grayscale fallback
     lut.Build()
     return lut
 
