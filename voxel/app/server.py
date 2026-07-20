@@ -201,6 +201,14 @@ def create_server():
     state.setdefault("slice_x_pos", 50)
     state.setdefault("slice_y_pos", 50)
     state.setdefault("slice_z_pos", 50)
+    # Per-axis azimuthal (phi) tilt of each orthogonal slice plane, in degrees.
+    # phi = 0 keeps the plane perpendicular to its axis (the classic behavior);
+    # a non-zero phi rotates the plane normal so the slice is no longer centered
+    # on the pure x/y/z axis. X and Y planes tilt about the Qz (vertical) axis;
+    # the Z plane tilts about the Qx axis (a Z rotation would be a no-op there).
+    state.setdefault("slice_x_phi", 0)
+    state.setdefault("slice_y_phi", 0)
+    state.setdefault("slice_z_phi", 0)
     state.setdefault("slice_opacity", 0.8)
     state.setdefault("slice_cmap", "turbo")
     state.setdefault("slice_show_border", True)
@@ -222,6 +230,11 @@ def create_server():
     state.setdefault("cyl_samples", 64)
     state.setdefault("cyl_opacity", 0.7)
     state.setdefault("cyl_cmap", "plasma")
+    # Azimuthal (phi) tilt of the cylinder axis, in degrees. phi = 0 keeps the
+    # cylinder axis aligned with Qz (the classic behavior); a non-zero phi
+    # tilts the axis in the Qy-Qz plane so the tube is no longer centered on
+    # the z axis.
+    state.setdefault("cyl_phi", 0)
 
     ## spherical slicing (Q space only)
     state.setdefault("sph_show", False)
@@ -1000,6 +1013,20 @@ def create_server():
         hi = origin[axis_index] + spacing[axis_index] * max(0, dims[axis_index] - 1)
         return float(lo), float(hi)
 
+    def _rotate_vector(vec, rot_axis, angle):
+        """Rotate a 3-vector by ``angle`` radians about a world axis.
+
+        ``rot_axis`` is 0 (Qx), 1 (Qy) or 2 (Qz). Used to tilt slice-plane
+        normals / the cylinder axis for the phi-rotation feature.
+        """
+        c, s = math.cos(angle), math.sin(angle)
+        x, y, z = vec
+        if rot_axis == 0:  # about Qx
+            return [x, y * c - z * s, y * s + z * c]
+        if rot_axis == 1:  # about Qy
+            return [x * c + z * s, y, -x * s + z * c]
+        return [x * c - y * s, x * s + y * c, z]  # about Qz
+
     def _update_ortho_slice(axis):
         if current_image is None or render_range is None:
             slice_actors[axis].VisibilityOff()
@@ -1019,6 +1046,14 @@ def create_server():
         center = current_image.GetCenter()
         origin[0], origin[1], origin[2] = center
         origin[axis_index] = coord
+
+        # Azimuthal (phi) tilt: rotate the plane normal so the slice is no
+        # longer perpendicular to its pure axis. X/Y planes tilt about Qz; the
+        # Z plane tilts about Qx (rotating a Z normal about Qz is a no-op).
+        phi = math.radians(_float(getattr(state, f"slice_{axis}_phi", 0.0), 0.0))
+        if phi:
+            rot_axis = 0 if axis == "z" else 2
+            normal = _rotate_vector(normal, rot_axis, phi)
 
         mapper = slice_mappers[axis]
         mapper.SetInputData(current_image)
@@ -1099,13 +1134,6 @@ def create_server():
         xs = radius * np.cos(theta)
         ys = radius * np.sin(theta)
 
-        # Nearest voxel index for each angle (clamped into range like np.argmin).
-        i_idx = np.clip(np.round((xs - ox) / sx).astype(int), 0, nx - 1) if sx else np.zeros(n_theta, dtype=int)
-        j_idx = np.clip(np.round((ys - oy) / sy).astype(int), 0, ny - 1) if sy else np.zeros(n_theta, dtype=int)
-
-        # Sample every z-slab at the clamped (i, j) ring: shape (nz, n_theta).
-        sampled = vol[:, j_idx, i_idx].astype(np.float32)
-
         # Vertex coordinates, ordered k (outer) then theta (inner) so vertex
         # index = k * n_theta + t matches ``sampled`` raveled in C order.
         zc = oz + np.arange(nz, dtype=np.float64) * sz
@@ -1113,6 +1141,28 @@ def create_server():
         coords[:, 0] = np.tile(xs, nz)
         coords[:, 1] = np.tile(ys, nz)
         coords[:, 2] = np.repeat(zc, n_theta)
+
+        # Azimuthal (phi) tilt: rotate the whole tube about Qx, pivoting on the
+        # z-center so the cylinder axis leans out of Qz into the Qy-Qz plane
+        # instead of staying centered on the z axis. phi = 0 leaves the classic
+        # z-aligned tube untouched.
+        phi = math.radians(_float(getattr(state, "cyl_phi", 0.0), 0.0))
+        if phi:
+            z_mid = 0.5 * (zc[0] + zc[-1]) if nz else 0.0
+            c, s = math.cos(phi), math.sin(phi)
+            yv = coords[:, 1].copy()
+            zv = coords[:, 2] - z_mid
+            coords[:, 1] = yv * c - zv * s
+            coords[:, 2] = z_mid + yv * s + zv * c
+
+        # Nearest voxel index per vertex (clamped into range like np.argmin), so
+        # every vertex carries a real intensity even after the tube is tilted.
+        i_idx = np.clip(np.round((coords[:, 0] - ox) / sx).astype(int), 0, nx - 1) if sx else np.zeros(nz * n_theta, dtype=int)
+        j_idx = np.clip(np.round((coords[:, 1] - oy) / sy).astype(int), 0, ny - 1) if sy else np.zeros(nz * n_theta, dtype=int)
+        k_idx = np.clip(np.round((coords[:, 2] - oz) / sz).astype(int), 0, nz - 1) if sz else np.zeros(nz * n_theta, dtype=int)
+
+        # Per-vertex sample; shape (nz * n_theta,) matching the coords order.
+        sampled = vol[k_idx, j_idx, i_idx].astype(np.float32)
 
         points = vtkPoints()
         points.SetData(numpy_support.numpy_to_vtk(coords, deep=True))
@@ -3364,6 +3414,20 @@ def create_server():
         if remote_view is not None:
             remote_view.update()
 
+    # Live-update the phi (azimuthal tilt) of the orthogonal slice planes and
+    # the cylinder axis as the user drags the right-panel angle inputs. A
+    # state.change observer reliably sees the flushed value (the input's own
+    # ``change=ctrl.update_slices`` can fire before v-model syncs), so the
+    # oblique slice re-renders immediately.
+    @state.change("slice_x_phi", "slice_y_phi", "slice_z_phi", "cyl_phi")
+    def _on_slice_phi_change(**kwargs):
+        if current_volume is None:
+            return
+        _update_all_slices()
+        render_window.Render()
+        if remote_view is not None:
+            remote_view.update()
+
     # Clamp the CMS angle step to the valid [0, 360] range. Corrects a typed out-of-range value.
     @state.change("cms_angle_step")
     def _on_cms_angle_step_change(cms_angle_step=None, **kwargs):
@@ -4254,6 +4318,25 @@ def create_server():
                         v_model=("slice_opacity", ""), type="number", min="0", max="1",
                         step="0.1", change=ctrl.update_slices, style=_pl_inp,
                     )
+                    # Azimuthal (phi) tilt of the slice plane. Each axis binds
+                    # its own angle so the plane can be oblique instead of
+                    # perpendicular to the pure x/y/z axis; X/Y tilt about Qz
+                    # and Z tilts about Qx (see _update_ortho_slice).
+                    html.Label("Rotation \u03c6 (\u00b0)", style=_pl_lbl)
+                    for _ax in ("x", "y", "z"):
+                        with html.Div(
+                            v_if=f"selected_layer === 'slice_{_ax}'",
+                            style="display:flex; align-items:center; gap:8px;",
+                        ):
+                            html.Input(
+                                v_model=(f"slice_{_ax}_phi", ""), type="range",
+                                min="-90", max="90", step="1",
+                                change=ctrl.update_slices, style="flex:1;",
+                            )
+                            html.Span(
+                                "{{ " + f"slice_{_ax}_phi" + " }}\u00b0",
+                                style="width:42px; font-size:0.8rem; text-align:right;",
+                            )
 
                 # Cylindrical probe surface.
                 with html.Div(v_if="selected_layer === 'cylinder'"):
@@ -4278,6 +4361,20 @@ def create_server():
                         v_model=("cyl_samples", ""), type="number", min="16", max="360",
                         step="8", change=ctrl.update_slices, style=_pl_inp,
                     )
+                    # Azimuthal (phi) tilt of the cylinder axis away from Qz
+                    # (see _update_cylinder), so the tube need not be centered
+                    # on the z axis.
+                    html.Label("Rotation \u03c6 (\u00b0)", style=_pl_lbl)
+                    with html.Div(style="display:flex; align-items:center; gap:8px;"):
+                        html.Input(
+                            v_model=("cyl_phi", ""), type="range",
+                            min="-90", max="90", step="1",
+                            change=ctrl.update_slices, style="flex:1;",
+                        )
+                        html.Span(
+                            "{{ cyl_phi }}\u00b0",
+                            style="width:42px; font-size:0.8rem; text-align:right;",
+                        )
 
                 # Spherical probe surface.
                 with html.Div(v_if="selected_layer === 'sphere'"):
