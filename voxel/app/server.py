@@ -4147,7 +4147,7 @@ def create_server():
                         style=(
                             "position:relative; width:100%; height:130px; "
                             "border:1px solid #3a3a40; border-radius:4px; "
-                            "background:#0b0b0e; overflow:hidden; "
+                            "background:#0b0b0e; overflow:visible; "
                             "touch-action:none; user-select:none; margin-bottom:6px;"
                         ),
                         dblclick=(
@@ -4246,7 +4246,7 @@ def create_server():
                             __events=["pointerdown", "pointermove", "pointerup"],
                             style=(
                                 "`position:absolute; left:${pt[0]*100}%; top:${(1-pt[1])*100}%;"
-                                " width:14px; height:14px; margin:-7px 0 0 -7px; border-radius:50%;"
+                                " width:10px; height:10px; margin:-5px 0 0 -5px; border-radius:50%;"
                                 " background:#ffffff; border:2px solid #6aa9ff; box-shadow:0 0 3px"
                                 " rgba(0,0,0,.7); touch-action:none; cursor:${pi===0||"
                                 "pi===opacity_points.length-1?'ns-resize':'move'}`",
