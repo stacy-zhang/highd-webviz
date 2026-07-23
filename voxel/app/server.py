@@ -193,7 +193,7 @@ def create_server():
     state.setdefault("export_tiff_path", str(Path.cwd() / "rsm_grid.tiff"))
     state.setdefault("export_npz_path", str(Path.cwd() / "rsm_grid.npz"))
 
-    # Analysis tab
+    # Analyze tab
     ## orthogonal slicing (positions are 0-100)
     state.setdefault("slice_x_show", False)
     state.setdefault("slice_y_show", False)
@@ -228,8 +228,9 @@ def create_server():
 
     ## phi = 0 reference plane: a translucent quad marking where the
     ## diffractometer's phi = 0 sample orientation lands in the reconstructed
-    ## volume -- the Qx-Qz plane (Qy = 0, i.e. the world x-z plane)
-    state.setdefault("phi0_show", True)
+    ## volume -- the Qx-Qz plane (Qy = 0, i.e. the world x-z plane) -- with a
+    ## floating "phi = 0" label. A visual orientation reference, off by default.
+    state.setdefault("phi0_show", False)
 
     ## cylindrical slicing (Q space only)
     state.setdefault("cyl_show", False)
@@ -314,7 +315,7 @@ def create_server():
     # Sidebar visibility
     state.setdefault("sidebar_open", True)
 
-    # Which tab is expanded ("" = all collapsed; one of data/build/view/analysis)
+    # Which tab is expanded ("" = all collapsed; one of data/build/view/analyze)
     state.setdefault("open_tab", "")
 
     # Right-side layer control panel: the list of scene layers available for the
@@ -405,9 +406,9 @@ def create_server():
     renderer.AddVolume(volume_actor)
     renderer.ResetCamera()
 
-    # --- Analysis: orthogonal slice actors (one per axis) ------------------
+    # --- Analyze: orthogonal slice actors (one per axis) ------------------
     # Each axis gets a vtkImageSlice backed by a reslice mapper. They are
-    # hidden until the user enables them in the Analysis tab.
+    # hidden until the user enables them in the Analyze tab.
     slice_actors = {}
     slice_mappers = {}
     for axis in ("x", "y", "z"):
@@ -421,7 +422,7 @@ def create_server():
         slice_mappers[axis] = mapper
         slice_actors[axis] = actor
 
-    # --- Analysis: cylindrical / spherical probe actors --------------------
+    # --- Analyze: cylindrical / spherical probe actors --------------------
     cyl_actor = vtkActor()
     cyl_actor.VisibilityOff()
     renderer.AddActor(cyl_actor)
@@ -550,12 +551,13 @@ def create_server():
         world_axes_labels.append(_wlbl)
 
     # --- phi = 0 reference plane -----------------------------------------
-    # 3D actor in the volume's (Q) world coordinates, so it rotates together with
-    # the map; comes with a floating "phi = 0" billboard label.
-    # Visual orientation reference, layer is toggled via ``phi0_show``
-    # The 4 corners span the Qx and Qz extents at Qy = 0, extended well beyond
-    # the volume in _update_phi0_plane so the edges stay visible even where the
-    # opaque volume covers the middle.
+    # A translucent quad marking where the diffractometer's phi = 0 sample
+    # rotation lands in the reconstructed reciprocal-space volume: the Qx-Qz
+    # plane (Qy = 0), i.e. the world x-z plane. Like the outline box it is a 3D
+    # actor in the volume's (Q) world coordinates, so it rotates together with
+    # the map; a floating "phi = 0" billboard label rides along. Purely a
+    # visual orientation reference, toggled via ``phi0_show`` and listed as its
+    # own layer. The 4 corners span the Qx and Qz extents at Qy = 0.
     phi0_pts = vtkPoints()
     phi0_pts.SetNumberOfPoints(4)
     phi0_poly = vtkPolyData()
@@ -571,61 +573,16 @@ def create_server():
     phi0_actor = vtkActor()
     phi0_actor.SetMapper(phi0_mapper)
     phi0_actor.GetProperty().SetColor(*_phi0_color)
-    phi0_actor.GetProperty().SetOpacity(0.15)
+    phi0_actor.GetProperty().SetOpacity(0.18)
     phi0_actor.GetProperty().LightingOff()
     phi0_actor.GetProperty().SetBackfaceCulling(0)  # visible from both sides
     phi0_actor.PickableOff()
     phi0_actor.VisibilityOff()
     renderer.AddActor(phi0_actor)
 
-    # Bright, opaque border tracing the same 4 corners so the plane's extent
-    # reads clearly even where the translucent fill is hidden behind the volume.
-    phi0_border_poly = vtkPolyData()
-    phi0_border_poly.SetPoints(phi0_pts)
-    _phi0_border_cells = vtkCellArray()
-    _phi0_loop = vtkPolyLine()
-    _phi0_loop.GetPointIds().SetNumberOfIds(5)
-    for _i, _pid in enumerate((0, 1, 2, 3, 0)):
-        _phi0_loop.GetPointIds().SetId(_i, _pid)
-    _phi0_border_cells.InsertNextCell(_phi0_loop)
-    phi0_border_poly.SetLines(_phi0_border_cells)
-    phi0_border_mapper = vtkPolyDataMapper()
-    phi0_border_mapper.SetInputData(phi0_border_poly)
-    phi0_border_actor = vtkActor()
-    phi0_border_actor.SetMapper(phi0_border_mapper)
-    phi0_border_actor.GetProperty().SetColor(*_phi0_color)
-    phi0_border_actor.GetProperty().SetLineWidth(2.5)
-    phi0_border_actor.GetProperty().LightingOff()
-    phi0_border_actor.PickableOff()
-    phi0_border_actor.VisibilityOff()
-    renderer.AddActor(phi0_border_actor)
-
-    # Leader line tying the off-to-the-side label back to the plane edge, so the
-    # label reads clearly away from the translucent fill yet stays associated.
-    phi0_leader_pts = vtkPoints()
-    phi0_leader_pts.SetNumberOfPoints(2)
-    phi0_leader_poly = vtkPolyData()
-    phi0_leader_poly.SetPoints(phi0_leader_pts)
-    _phi0_leader_cells = vtkCellArray()
-    _phi0_leader_line = vtkLine()
-    _phi0_leader_line.GetPointIds().SetId(0, 0)
-    _phi0_leader_line.GetPointIds().SetId(1, 1)
-    _phi0_leader_cells.InsertNextCell(_phi0_leader_line)
-    phi0_leader_poly.SetLines(_phi0_leader_cells)
-    phi0_leader_mapper = vtkPolyDataMapper()
-    phi0_leader_mapper.SetInputData(phi0_leader_poly)
-    phi0_leader_actor = vtkActor()
-    phi0_leader_actor.SetMapper(phi0_leader_mapper)
-    phi0_leader_actor.GetProperty().SetColor(*_phi0_color)
-    phi0_leader_actor.GetProperty().SetLineWidth(1.5)
-    phi0_leader_actor.GetProperty().LightingOff()
-    phi0_leader_actor.PickableOff()
-    phi0_leader_actor.VisibilityOff()
-    renderer.AddActor(phi0_leader_actor)
-
     phi0_label = vtkBillboardTextActor3D()
     phi0_label.SetInput("")
-    phi0_label.GetTextProperty().SetFontSize(16)
+    phi0_label.GetTextProperty().SetFontSize(15)
     phi0_label.GetTextProperty().SetColor(*_phi0_color)
     phi0_label.GetTextProperty().SetJustificationToCentered()
     phi0_label.PickableOff()
@@ -851,7 +808,7 @@ def create_server():
     regrid_volume = None
     regrid_axes = None
     # The vtkImageData built for display (log/contrast-scaled) — referenced by
-    # the slicing/probe helpers in the Analysis tab.
+    # the slicing/probe helpers in the Analyze tab.
     current_image = None
     # Robust display range (log-scaled) used to build the transfer functions.
     render_range = None
@@ -945,8 +902,6 @@ def create_server():
         for _lbl in world_axes_labels:
             _lbl.VisibilityOff()
         phi0_actor.VisibilityOff()
-        phi0_border_actor.VisibilityOff()
-        phi0_leader_actor.VisibilityOff()
         phi0_label.VisibilityOff()
 
     def _free_gpu_resources(*mappers):
@@ -1115,7 +1070,7 @@ def create_server():
         _rebuild_volume_layers()
         return current_volume, current_axes
         # ---------------------------------------------------------------------
-    # Analysis: orthogonal / cylindrical / spherical slicing helpers
+    # Analyze: orthogonal / cylindrical / spherical slicing helpers
     # ---------------------------------------------------------------------
     def _axis_bounds(image, axis_index):
         origin = image.GetOrigin()
@@ -1642,63 +1597,40 @@ def create_server():
     renderer.AddObserver("StartEvent", _update_scale_bar)
 
     def _update_phi0_plane():
-        """Draw the phi = 0 reference plane (the Qx-Qz / Qy=0 plane).
+        """Draw the translucent phi = 0 reference plane (the Qx-Qz / Qy=0 plane).
 
         Marks where the diffractometer's phi = 0 sample orientation maps into
-        the reconstructed volume: the world x-z plane at Qy = 0. The quad is
-        extended 20% beyond the volume's Qx and Qz extents so its bright
-        border stays visible even where the opaque volume covers the middle. A
-        "phi = 0" label sits off to the +Qx side and is tied to the plane's
-        corner by a leader line. The z world axis is mirrored in
-        ``_set_volume_data`` (world z = -Qz), so the corners use -Qz.
+        the reconstructed volume: the world x-z plane at Qy = 0. The quad spans
+        the volume's Qx and Qz extents (read from ``current_axes`` like the
+        outline box) at world y = 0, and a billboard label reads "phi = 0". The
+        z world axis is mirrored in ``_set_volume_data`` (world z = -Qz), so the
+        corners use -Qz.
         """
         show = bool(getattr(state, "phi0_show", False))
         if current_image is None or current_axes is None or not show:
             phi0_actor.VisibilityOff()
-            phi0_border_actor.VisibilityOff()
-            phi0_leader_actor.VisibilityOff()
             phi0_label.VisibilityOff()
             return
 
         ax_x = np.asarray(current_axes[0], dtype=float)
         ax_z = np.asarray(current_axes[2], dtype=float)
-        x_lo, x_hi = float(ax_x[0]), float(ax_x[-1])
-        # world z = -Qz (mirrored); normalize to lo/hi regardless of sign.
-        wz_a, wz_b = -float(ax_z[0]), -float(ax_z[-1])
-        z_lo, z_hi = min(wz_a, wz_b), max(wz_a, wz_b)
+        x0, x1 = float(ax_x[0]), float(ax_x[-1])
+        # world z = -Qz (mirrored); span the full Qz extent.
+        wz0, wz1 = -float(ax_z[0]), -float(ax_z[-1])
         y = 0.0  # Qy = 0 -> the x-z plane
 
-        # Extend the quad beyond the volume so its edges remain visible.
-        span_x = max(x_hi - x_lo, 1e-6)
-        span_z = max(z_hi - z_lo, 1e-6)
-        mx = 0.20 * span_x
-        mz = 0.20 * span_z
-        ex_lo, ex_hi = x_lo - mx, x_hi + mx
-        ez_lo, ez_hi = z_lo - mz, z_hi + mz
-
-        phi0_pts.SetPoint(0, ex_lo, y, ez_lo)
-        phi0_pts.SetPoint(1, ex_hi, y, ez_lo)
-        phi0_pts.SetPoint(2, ex_hi, y, ez_hi)
-        phi0_pts.SetPoint(3, ex_lo, y, ez_hi)
+        phi0_pts.SetPoint(0, x0, y, wz0)
+        phi0_pts.SetPoint(1, x1, y, wz0)
+        phi0_pts.SetPoint(2, x1, y, wz1)
+        phi0_pts.SetPoint(3, x0, y, wz1)
         phi0_pts.Modified()
-
-        # Label off to the side (beyond the +Qx / top corner), tied back to the
-        # plane's top-right corner by a leader line.
-        anchor = (ex_hi, y, ez_hi)
-        label_pos = (ex_hi + 0.3 * span_x, y, ez_hi + 0.18 * span_z)
-        phi0_leader_pts.SetPoint(0, *anchor)
-        phi0_leader_pts.SetPoint(1, *label_pos)
-        phi0_leader_pts.Modified()
 
         is_q = (_ensure_path(getattr(state, "space", "q")) or "q").lower() == "q"
         mid = "Qy" if is_q else "K"
-        phi0_label.SetInput(f"phi = 0  ({mid} = 0)")
-        phi0_label.SetPosition(*label_pos)
-
-        phi0_actor.VisibilityOn()
-        phi0_border_actor.VisibilityOn()
-        phi0_leader_actor.VisibilityOn()
+        phi0_label.SetInput(f"\u03c6 = 0  ({mid} = 0)")
+        phi0_label.SetPosition(x1, y, wz1)
         phi0_label.SetVisibility(1)
+        phi0_actor.VisibilityOn()
 
     def _update_all_slices():
         try:
@@ -3582,7 +3514,7 @@ def create_server():
         if remote_view is not None:
             remote_view.update()
 
-    # Live-update the Analysis-tab slicing colormaps (orthogonal / cylindrical /
+    # Live-update the Analyze-tab slicing colormaps (orthogonal / cylindrical /
     # spherical) the moment the user picks a new one from the dropdown, without
     # needing to toggle the slice off and on again. The select's own
     # ``change=ctrl.update_slices`` handler can miss the fresh value because the
@@ -3964,13 +3896,13 @@ def create_server():
                     html.Input(v_model=("export_npz_path", ""), placeholder="/path/to/grid.npz", style=_inp)
                     html.Button("\U0001F4BE Export NPZ", click=ctrl.export_npz, style="width:100%; margin-top:12px; padding:10px 8px; cursor:pointer;")
 
-                # ===================== ANALYSIS TAB =====================
+                # ===================== ANALYZE TAB =====================
                 with html.Div(
-                    style=_bar, click="open_tab = open_tab === 'analysis' ? '' : 'analysis'"
+                    style=_bar, click="open_tab = open_tab === 'analyze' ? '' : 'analyze'"
                 ):
-                    html.Span("Analysis")
-                    html.Span("{{ open_tab === 'analysis' ? '\u25BC' : '\u25B6' }}")
-                with html.Div(v_show="open_tab === 'analysis'", style=_panel):
+                    html.Span("Analyze")
+                    html.Span("{{ open_tab === 'analyze' ? '\u25BC' : '\u25B6' }}")
+                with html.Div(v_show="open_tab === 'analyze'", style=_panel):
                     # --- Orthogonal slicing ---
                     html.Strong("Orthogonal Slicing", style="display:block;")
                     for ax, lbl in (("x", "X"), ("y", "Y"), ("z", "Z")):
