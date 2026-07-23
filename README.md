@@ -1,11 +1,11 @@
-# Napari ResView Web Application
+# Voxel Web Application
 
 A web-based interface for exploring 3D reconstructed reciprocal-space maps (RSMs), built with [Trame](https://kitware.github.io/trame/) and VTK. Reproduces all interactive functionality from the Napari ResView plugin in a browser-accessible single-window application.
 
 ## Features
 
 - **Interactive 3D Volume Rendering**: GPU-accelerated volume visualization with real-time rotation, zoom, and panning
-- **Tabbed Accordion Control Panel**: The left panel is organized into four collapsible tabs — **Data**, **Build**, **View**, and **Analysis**
+- **Tabbed Accordion Control Panel**: The left panel is organized into four collapsible tabs — **Data**, **Build**, **View**, and **Analyze**
 - **Step-by-Step Pipeline**: Each stage has its own button — Load Data, View Intensity, Crop from ROI, Build RSM, Regrid, View RSM, Refresh, and Stop — so each step can be run and inspected independently
 - **Dual Loader Support**:
   - **CMS mode**: Load 3D diffraction data from a TIFF directory (with a configurable angle step) without SPEC metadata
@@ -117,7 +117,7 @@ pixi run python -m voxel --no-browser
 3. Click **Stop** to cancel a running load/build/regrid task.
 4. Set the **Export Path** (.vtr) and use the export control to save.
 
-### 4. Analysis tab — slicing
+### 4. Analyze tab — slicing
 
 - Toggle **orthogonal** X/Y/Z plane slices and adjust their position, opacity,
   and colormap.
